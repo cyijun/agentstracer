@@ -1,0 +1,336 @@
+Metadata-Version: 2.4
+Name: clawtrace
+Version: 0.1.11
+Summary: Review, score, and curate your coding agent conversation traces locally
+Author: kaiaiagent
+License-Expression: MIT
+Keywords: claude-code,codex,gemini-cli,opencode,openclaw,dataset,conversations
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Dynamic: license-file
+
+# ClawTrace
+
+Review and curate your coding agent conversation traces — 100% locally. ClawTrace scans session logs from Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
+
+## Your data stays local
+
+- **Nothing leaves your machine** unless you explicitly choose to share.
+- **Secrets and PII are auto-redacted** — API keys, tokens, passwords, and personal info are replaced with `[REDACTED]` before any export.
+- **PII review before sharing** — `clawtrace export --pii-review --pii-apply` adds AI-assisted detection on top of automatic redaction.
+- **Privacy report after every share** — you'll always see exactly what was redacted (e.g., "3 API keys, 2 JWT tokens, 1 database URL redacted"). No silent uploads.
+- **Preview before sharing** — `clawtrace share --preview` shows exactly what would be uploaded. No surprises.
+- **You choose what's included** — approve, block, or exclude sessions and projects at every step.
+
+## What gets anonymized
+
+Every export passes through multiple layers of automatic protection:
+
+| What | How it's protected |
+|------|-------------------|
+| File paths | Stripped to project-relative paths. Your home directory and username are removed. |
+| Your username | Replaced with an anonymous hash (e.g., `user_a1b2c3d4`), consistent across exports. |
+| API keys & tokens | Auto-detected and redacted: Anthropic, OpenAI, GitHub, AWS, Slack, Discord, HuggingFace, PyPI, NPM, and more. |
+| Passwords & database URLs | Connection strings and secrets in environment variables are caught and redacted. |
+| Private keys | SSH, RSA, EC, and OpenSSH private keys are detected and removed. |
+| Email addresses | Personal email addresses are replaced with `[REDACTED]`. |
+| Suspicious strings | Long random-looking strings (potential secrets) are flagged using entropy analysis. |
+| Timestamps | Coarsened to hour-level in exports — exact times are not shared. |
+| Custom strings | Add your own company names, domains, or project names to always redact. |
+
+Automated redaction catches the vast majority of secrets. For extra protection, add AI-assisted PII detection on top:
+
+```bash
+clawtrace export --pii-review --pii-apply
+# Or with hybrid AI provider:
+clawtrace export --pii-review --pii-provider hybrid
+```
+
+---
+
+## Quickstart
+
+### Option 1: Universal skills (recommended)
+
+Works with Claude Code, Codex, Cursor, Gemini CLI, OpenCode, and [many more](https://github.com/nicepkg/skills). The setup wizard handles Python, installation, and configuration automatically.
+
+```bash
+npx skills add kaiaiagent/clawtrace
+```
+
+Then inside your agent, say `setup clawtrace`. The three skills added are:
+- **clawtrace-setup** — interactive wizard to install, scan sessions, and launch the workbench
+- **clawtrace** — review, triage, and share traces
+- **clawtrace-score** — AI-assisted quality scoring
+
+### Option 2: Paste this into any coding agent
+
+No setup required — just paste this prompt into any coding agent:
+
+```
+Help me set up ClawTrace to review my coding agent traces.
+Install it with pip (use a venv if needed), scan my sessions, and open the review workbench.
+Everything runs 100% locally — nothing is uploaded without my approval.
+```
+
+### Option 3: Manual setup
+
+```bash
+pip install clawtrace
+clawtrace scan          # Find all your local sessions
+clawtrace serve         # Open review UI at localhost:8384
+```
+
+<details>
+<summary><b>Python not installed?</b></summary>
+
+ClawTrace requires Python 3.10+.
+
+| Platform | Install command |
+|----------|----------------|
+| **macOS** | `brew install python` |
+| **Windows** | Download from [python.org/downloads](https://python.org/downloads) — check "Add to PATH" |
+| **Linux** | `sudo apt install python3-full` (includes venv support) |
+
+</details>
+
+<details>
+<summary><b>Using a virtual environment (recommended)</b></summary>
+
+Modern Linux distributions (Debian 12+, Ubuntu 23.04+) and some macOS setups block system-wide pip installs ([PEP 668](https://peps.python.org/pep-0668/)).
+
+```bash
+python3 -m venv ~/.clawtrace-venv
+source ~/.clawtrace-venv/bin/activate
+pip install clawtrace
+```
+
+> If you see `externally-managed-environment`, make sure the venv is activated (your prompt should show `(.clawtrace-venv)`).
+
+</details>
+
+### Supported agents
+
+ClawTrace can parse session data from: Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline.
+
+---
+
+## Workflow
+
+ClawTrace enforces a step-by-step workflow to prevent accidental data leaks. Steps 2-3 are required before export; the rest are recommended. The entire workflow runs in your terminal — no browser needed (also works on remote VMs over SSH).
+
+```
+ Scan ──> Configure ──> Confirm ──> [Triage] ──> [PII Review] ──> Share
+  1           2            3           4              5             6
+           required ──────┘           optional/recommended
+```
+
+### Step 1 — Scan
+
+```bash
+clawtrace scan
+```
+
+Discovers and indexes sessions. Not gated, but should run first so later steps have data to work with.
+
+### Step 2 — Configure source (required)
+
+```bash
+clawtrace config --source all
+# Options: claude, codex, gemini, opencode, openclaw, kimi, custom, all
+```
+
+### Step 3 — Review and confirm projects (required)
+
+```bash
+clawtrace list                                     # See all discovered projects
+clawtrace config --exclude "project1,project2"     # Optional: exclude projects
+clawtrace config --confirm-projects                # Required: lock in project selection
+```
+
+### Step 4 — Triage sessions (recommended)
+
+```bash
+# Browse and search
+clawtrace inbox --json --limit 20
+clawtrace search "refactor auth" --json
+
+# Approve or block
+clawtrace approve <session_id> --reason "clean trace"
+clawtrace block <session_id> --reason "proprietary code"
+
+# Optional: AI-assisted scoring with the current agent's automation CLI (auto-approves 4-5, blocks 1-2)
+clawtrace score --batch --auto-triage
+```
+
+By default, `clawtrace score` uses the current agent's automation CLI. For example, inside Codex it uses `codex exec`; inside Claude Code it uses the Claude CLI; inside OpenClaw it uses `openclaw agent --json`. It does not attach to the live interactive session or use Codex subagents. Use `--backend` to override when needed.
+
+For Codex specifically, this follows Codex non-interactive mode: `codex exec` reuses saved CLI authentication by default, and for automation the recommended explicit credential is `CODEX_API_KEY`.
+
+### Step 5 — Export with PII redaction (recommended)
+
+```bash
+clawtrace export --pii-review --pii-apply
+```
+
+Runs AI-assisted PII detection on top of automatic regex-based redaction. Recommended before sharing, but not required — automatic redaction still applies to every export.
+
+### Step 6 — Preview and share
+
+```bash
+clawtrace share --status approved --preview        # Dry run — see what would be shared
+clawtrace share --status approved --note "week 12"  # Upload after confirming
+```
+
+For a visual review experience: `clawtrace serve` (local) or `clawtrace serve --remote` (prints SSH tunnel command for remote VMs).
+
+---
+
+## Command reference
+
+<details>
+<summary><b>All commands</b></summary>
+
+### Essential
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace scan` | Index local sessions into workbench DB |
+| `clawtrace serve` | Open workbench UI at localhost:8384 |
+| `clawtrace config --source all` | Select source scope — `claude`, `codex`, `gemini`, `opencode`, `openclaw`, `kimi`, `custom`, or `all` (required) |
+| `clawtrace config --confirm-projects` | Confirm project selection (required before export) |
+| `clawtrace score --batch --auto-triage` | AI-score sessions with the current agent's automation CLI, auto-approve 4-5 and block 1-2 |
+| `clawtrace export --pii-review --pii-apply` | Export with PII redaction (recommended before sharing) |
+| `clawtrace share --status approved` | Bundle + share (shows privacy report) |
+
+### Quick share
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace recent` | Show recent sessions (auto-scans if stale) |
+| `clawtrace recent --source openclaw --since today` | Filter by source and time |
+| `clawtrace card <id>` | Generate a share card for a session |
+| `clawtrace card <id> --depth workflow` | Workflow-only card (safe for public channels) |
+| `clawtrace card <id> --depth full` | Full card with redacted content |
+
+### Review & triage
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace inbox --json --limit 20` | List sessions as JSON (for agent parsing) |
+| `clawtrace search <query> --json` | Full-text search across sessions |
+| `clawtrace approve <id> [id ...]` | Approve sessions by ID |
+| `clawtrace block <id> [id ...]` | Block sessions by ID |
+| `clawtrace shortlist <id> [id ...]` | Shortlist sessions for review |
+| `clawtrace score --batch --limit 20` | AI-score up to 20 sessions with the current agent's automation CLI |
+| `clawtrace score-view <id>` | View score details for a session |
+| `clawtrace set-score <id> --quality <1-5>` | Manually set a quality score |
+
+### Bundles
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace bundle-create --status approved` | Create bundle from all approved sessions |
+| `clawtrace bundle-list` | List all bundles |
+| `clawtrace bundle-view <bundle_id>` | View bundle details and sessions |
+| `clawtrace bundle-export <bundle_id>` | Export bundle to disk (JSONL + manifest) |
+| `clawtrace bundle-share <bundle_id>` | Upload bundle to ClawTrace ingest service |
+
+### Export & PII
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace export` | Export to local JSONL |
+| `clawtrace export --no-thinking` | Exclude extended thinking blocks |
+| `clawtrace export --pii-review --pii-apply` | Export, generate PII findings, and produce sanitized JSONL |
+| `clawtrace pii-review --file <file> --output <findings.json>` | Run PII detection on an exported file |
+| `clawtrace pii-apply --file <file> --findings <findings.json> --output <sanitized.jsonl>` | Apply PII redactions to an exported file |
+| `clawtrace pii-rubric` | Show PII entity types and detection rules |
+
+### Configuration
+
+| Command | Description |
+|---------|-------------|
+| `clawtrace config --exclude "a,b"` | Add excluded projects (appends) |
+| `clawtrace config --redact "str1,str2"` | Add strings to always redact (appends) |
+| `clawtrace config --redact-usernames "u1,u2"` | Add usernames to anonymize (appends) |
+| `clawtrace list` | List all projects with exclusion status |
+| `clawtrace status` | Show current stage and next steps (JSON) |
+| `clawtrace update-skill claude` | Install/update the clawtrace skill for a specific agent |
+| `clawtrace serve --remote` | Print SSH tunnel command for remote VM access |
+
+</details>
+
+<details>
+<summary><b>What gets exported & data schema</b></summary>
+
+| Data | Included | Notes |
+|------|----------|-------|
+| User messages | Yes | Full text (including voice transcripts) |
+| Assistant responses | Yes | Full text output |
+| Extended thinking | Yes | Claude's reasoning (opt out with `--no-thinking`) |
+| Tool calls | Yes | Tool name + inputs + outputs |
+| Token usage | Yes | Input/output tokens per session |
+| Model & metadata | Yes | Model name, git branch, timestamps |
+
+Each line in the exported JSONL is one session:
+
+```json
+{
+  "session_id": "abc-123",
+  "project": "my-project",
+  "model": "claude-opus-4-6",
+  "git_branch": "main",
+  "start_time": "2025-06-15T10:00:00+00:00",
+  "end_time": "2025-06-15T10:30:00+00:00",
+  "messages": [
+    {"role": "user", "content": "Fix the login bug", "timestamp": "..."},
+    {
+      "role": "assistant",
+      "content": "I'll investigate the login flow.",
+      "thinking": "The user wants me to look at...",
+      "tool_uses": [
+          {
+            "tool": "bash",
+            "input": {"command": "grep -r 'login' src/"},
+            "output": {"text": "src/auth.py:42: def login(user, password):"},
+            "status": "success"
+          }
+        ],
+      "timestamp": "..."
+    }
+  ],
+  "stats": {
+    "user_messages": 5, "assistant_messages": 8,
+    "tool_uses": 20, "input_tokens": 50000, "output_tokens": 3000
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><b>Gotchas</b></summary>
+
+- **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
+- **Source and project confirmation are required** — the CLI will block export until both are set.
+- **Run PII review before sharing** — automated redaction is good but not foolproof. `--pii-review --pii-apply` adds AI-assisted detection.
+- **Large exports take time** — 500+ sessions may take 1-3 minutes.
+- **Virtual environment recommended** — modern Linux (and some macOS setups) block system-wide pip installs. Use a venv to avoid issues.
+
+</details>
+
+## License
+
+MIT
