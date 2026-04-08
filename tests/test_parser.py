@@ -24,6 +24,46 @@ from clawtrace.parser import (
 )
 
 
+class MockAnonymizer:
+    """Simple mock anonymizer that returns values unchanged."""
+
+    def path(self, value):
+        return value
+
+    def text(self, value):
+        return value
+
+
+@pytest.fixture
+def mock_anonymizer():
+    return MockAnonymizer()
+
+
+@pytest.fixture
+def sample_user_entry():
+    return {
+        "type": "user",
+        "timestamp": 1706000000000,
+        "message": {"content": "Hello"},
+        "cwd": "/tmp/proj",
+        "gitBranch": "main",
+        "version": "1.0.0",
+    }
+
+
+@pytest.fixture
+def sample_assistant_entry():
+    return {
+        "type": "assistant",
+        "timestamp": 1706000001000,
+        "message": {
+            "model": "claude-sonnet-4",
+            "content": [{"type": "text", "text": "Hi!"}],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        },
+    }
+
+
 # --- _build_project_name ---
 
 

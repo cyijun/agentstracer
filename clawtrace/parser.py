@@ -663,7 +663,7 @@ def _make_session_result(
 ) -> dict[str, Any] | None:
     if not messages:
         return None
-    return {
+    result: dict[str, Any] = {
         "session_id": metadata["session_id"],
         "model": metadata["model"],
         "git_branch": metadata["git_branch"],
@@ -672,6 +672,10 @@ def _make_session_result(
         "messages": messages,
         "stats": stats,
     }
+    # Include session_status if present (for OpenClaw sessions)
+    if "session_status" in metadata:
+        result["session_status"] = metadata["session_status"]
+    return result
 
 
 def _build_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
@@ -990,6 +994,16 @@ def _parse_openclaw_session_file(
     if header.get("type") != "session":
         return None
 
+    # Determine session status from filename suffix
+    # active: .jsonl, reset: .jsonl.reset.<timestamp>, deleted: .jsonl.deleted.<timestamp>
+    filename = filepath.name
+    if ".jsonl.deleted." in filename:
+        session_status = "deleted"
+    elif ".jsonl.reset." in filename:
+        session_status = "reset"
+    else:
+        session_status = "active"
+
     metadata: dict[str, Any] = {
         "session_id": header.get("id", filepath.stem),
         "cwd": None,
@@ -997,6 +1011,7 @@ def _parse_openclaw_session_file(
         "model": None,
         "start_time": header.get("timestamp"),
         "end_time": None,
+        "session_status": session_status,
     }
     cwd = header.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
@@ -1796,7 +1811,11 @@ def _get_openclaw_project_index(refresh: bool = False) -> dict[str, list[Path]]:
 
 
 def _build_openclaw_project_index() -> dict[str, list[Path]]:
-    """Scan ~/.openclaw/agents/*/sessions/*.jsonl, read each session header to get cwd."""
+    """Scan ~/.openclaw/agents/*/sessions/*.jsonl*, read each session header to get cwd.
+
+    Includes regular sessions (*.jsonl), reset sessions (*.jsonl.reset.*),
+    and deleted sessions (*.jsonl.deleted.*).
+    """
     if not OPENCLAW_AGENTS_DIR.exists():
         return {}
 
@@ -1806,7 +1825,11 @@ def _build_openclaw_project_index() -> dict[str, list[Path]]:
             sessions_dir = agent_dir / "sessions"
             if not sessions_dir.is_dir():
                 continue
-            for session_file in sorted(sessions_dir.glob("*.jsonl")):
+            # Discover all session files: .jsonl, .jsonl.reset.*, .jsonl.deleted.*
+            for session_file in sorted(sessions_dir.glob("*.jsonl*")):
+                # Skip non-session files like sessions.json index
+                if session_file.suffix == ".json" or not session_file.is_file():
+                    continue
                 cwd = _extract_openclaw_cwd(session_file) or UNKNOWN_OPENCLAW_CWD
                 index.setdefault(cwd, []).append(session_file)
     except OSError:
