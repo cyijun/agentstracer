@@ -1,16 +1,16 @@
-"""Tests for clawtrace.scoring — pure functions (no LLM calls)."""
+"""Tests for agentstrace.scoring — pure functions (no LLM calls)."""
 
 import json
 
 import pytest
 
-from clawtrace.backends import (
+from agentstrace.backends import (
     _classify_process_command,
     _detect_current_agent_from_env,
     check_backend_runtime as _check_backend_runtime,
     format_codex_runtime_error as _format_codex_runtime_error,
 )
-from clawtrace.scoring import (
+from agentstrace.scoring import (
     SCORING_BACKEND_CHOICES,
     SCORING_BACKEND_RUNNERS,
     Segment,
@@ -338,7 +338,7 @@ class TestBackendSelection:
         assert _resolve_scoring_backend("codex", {}) == "codex"
 
     def test_resolve_backend_env_override(self):
-        env = {"CLAWTRACE_SCORER_BACKEND": "claude"}
+        env = {"AGENTSTRACE_SCORER_BACKEND": "claude"}
         assert _resolve_scoring_backend("auto", env) == "claude"
 
     def test_resolve_backend_raises_without_current_agent(self):
@@ -347,7 +347,7 @@ class TestBackendSelection:
 
     def test_call_judge_dispatches_to_codex(self, monkeypatch):
         monkeypatch.setenv("CODEX_THREAD_ID", "thread-123")
-        monkeypatch.setattr("clawtrace.scoring.load_scoring_rubric", lambda: "rubric")
+        monkeypatch.setattr("agentstrace.scoring.load_scoring_rubric", lambda: "rubric")
         monkeypatch.setitem(
             SCORING_BACKEND_RUNNERS,
             "codex",
@@ -393,7 +393,7 @@ class TestBackendSelection:
         assert "codex login" in message
 
     def test_call_judge_dispatches_to_openclaw(self, monkeypatch):
-        monkeypatch.setattr("clawtrace.scoring.load_scoring_rubric", lambda: "rubric")
+        monkeypatch.setattr("agentstrace.scoring.load_scoring_rubric", lambda: "rubric")
         monkeypatch.setitem(
             SCORING_BACKEND_RUNNERS,
             "openclaw",

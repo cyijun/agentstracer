@@ -1,4 +1,4 @@
-"""Tests for clawtrace.cli — CLI commands and helpers."""
+"""Tests for agentstrace.cli — CLI commands and helpers."""
 
 import json
 import sys
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from clawtrace.cli import (
+from agentstrace.cli import (
     _build_status_next_steps,
     _build_dataset_card,
     _collect_review_attestations,
@@ -239,7 +239,7 @@ class TestBuildDatasetCard:
         }
         card = _build_dataset_card("user/repo", meta)
         assert "---" in card  # YAML frontmatter
-        assert "clawtrace" in card
+        assert "agentstrace" in card
         assert "claude-sonnet" in card
         assert "10" in card
 
@@ -283,7 +283,7 @@ class TestExportToJsonl:
             "project": "test",
         }]
         monkeypatch.setattr(
-            "clawtrace.cli.parse_project_sessions",
+            "agentstrace.cli.parse_project_sessions",
             lambda *a, **kw: session_data,
         )
 
@@ -304,7 +304,7 @@ class TestExportToJsonl:
             "stats": {},
         }]
         monkeypatch.setattr(
-            "clawtrace.cli.parse_project_sessions",
+            "agentstrace.cli.parse_project_sessions",
             lambda *a, **kw: session_data,
         )
         projects = [{"dir_name": "test", "display_name": "test"}]
@@ -321,7 +321,7 @@ class TestExportToJsonl:
             "stats": {"input_tokens": 10, "output_tokens": 5},
         }]
         monkeypatch.setattr(
-            "clawtrace.cli.parse_project_sessions",
+            "agentstrace.cli.parse_project_sessions",
             lambda *a, **kw: session_data,
         )
         projects = [{"dir_name": "test", "display_name": "test"}]
@@ -337,7 +337,7 @@ class TestExportToJsonl:
             "stats": {},
         }]
         monkeypatch.setattr(
-            "clawtrace.cli.parse_project_sessions",
+            "agentstrace.cli.parse_project_sessions",
             lambda *a, **kw: session_data,
         )
         projects = [{"dir_name": "t", "display_name": "t"}]
@@ -352,28 +352,28 @@ class TestExportToJsonl:
 class TestConfigure:
     def test_sets_repo(self, tmp_config, monkeypatch, capsys):
         # Also monkeypatch the cli module's references
-        monkeypatch.setattr("clawtrace.cli.CONFIG_FILE", tmp_config)
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"repo": None, "excluded_projects": [], "redact_strings": []})
+        monkeypatch.setattr("agentstrace.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"repo": None, "excluded_projects": [], "redact_strings": []})
         saved = {}
-        monkeypatch.setattr("clawtrace.cli.save_config", lambda c: saved.update(c))
+        monkeypatch.setattr("agentstrace.cli.save_config", lambda c: saved.update(c))
 
         configure(repo="alice/my-repo")
         assert saved["repo"] == "alice/my-repo"
 
     def test_merges_exclude(self, tmp_config, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli.CONFIG_FILE", tmp_config)
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"excluded_projects": ["a"], "redact_strings": []})
+        monkeypatch.setattr("agentstrace.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"excluded_projects": ["a"], "redact_strings": []})
         saved = {}
-        monkeypatch.setattr("clawtrace.cli.save_config", lambda c: saved.update(c))
+        monkeypatch.setattr("agentstrace.cli.save_config", lambda c: saved.update(c))
 
         configure(exclude=["b", "c"])
         assert sorted(saved["excluded_projects"]) == ["a", "b", "c"]
 
     def test_sets_source(self, tmp_config, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli.CONFIG_FILE", tmp_config)
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"repo": None, "source": None})
+        monkeypatch.setattr("agentstrace.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"repo": None, "source": None})
         saved = {}
-        monkeypatch.setattr("clawtrace.cli.save_config", lambda c: saved.update(c))
+        monkeypatch.setattr("agentstrace.cli.save_config", lambda c: saved.update(c))
 
         configure(source="codex")
         assert saved["source"] == "codex"
@@ -385,11 +385,11 @@ class TestConfigure:
 class TestListProjects:
     def test_with_projects(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "clawtrace.cli.discover_projects",
+            "agentstrace.cli.discover_projects",
             lambda: [{"display_name": "proj1", "session_count": 5, "total_size_bytes": 1024}],
         )
         monkeypatch.setattr(
-            "clawtrace.cli.load_config",
+            "agentstrace.cli.load_config",
             lambda: {"excluded_projects": []},
         )
         list_projects()
@@ -399,20 +399,20 @@ class TestListProjects:
         assert data[0]["name"] == "proj1"
 
     def test_no_projects(self, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli.discover_projects", lambda: [])
+        monkeypatch.setattr("agentstrace.cli.discover_projects", lambda: [])
         list_projects()
         captured = capsys.readouterr()
         assert "No Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "clawtrace.cli.discover_projects",
+            "agentstrace.cli.discover_projects",
             lambda: [
                 {"display_name": "proj1", "session_count": 5, "total_size_bytes": 1024, "source": "claude"},
                 {"display_name": "codex:proj2", "session_count": 3, "total_size_bytes": 512, "source": "codex"},
             ],
         )
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"excluded_projects": []})
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"excluded_projects": []})
         list_projects(source_filter="codex")
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -422,7 +422,7 @@ class TestListProjects:
 
     def test_no_projects_for_selected_source(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "clawtrace.cli.discover_projects",
+            "agentstrace.cli.discover_projects",
             lambda: [{"display_name": "proj1", "session_count": 5, "total_size_bytes": 1024, "source": "claude"}],
         )
         list_projects(source_filter="codex")
@@ -431,14 +431,14 @@ class TestListProjects:
 
     def test_main_list_uses_configured_source_when_auto(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            "clawtrace.cli.discover_projects",
+            "agentstrace.cli.discover_projects",
             lambda: [
                 {"display_name": "proj1", "session_count": 5, "total_size_bytes": 1024, "source": "claude"},
                 {"display_name": "codex:proj2", "session_count": 3, "total_size_bytes": 512, "source": "codex"},
             ],
         )
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"source": "codex", "excluded_projects": []})
-        monkeypatch.setattr("sys.argv", ["clawtrace", "list"])
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"source": "codex", "excluded_projects": []})
+        monkeypatch.setattr("sys.argv", ["agentstrace", "list"])
         main()
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -457,7 +457,7 @@ class TestWorkflowGateMessages:
         missing = tmp_path / "missing.jsonl"
         monkeypatch.setattr(
             "sys.argv",
-            ["clawtrace", "confirm", "--file", str(missing)],
+            ["agentstrace", "confirm", "--file", str(missing)],
         )
         with pytest.raises(SystemExit):
             main()
@@ -473,7 +473,7 @@ class TestWorkflowGateMessages:
         monkeypatch.setattr(
             "sys.argv",
             [
-                "clawtrace",
+                "agentstrace",
                 "confirm",
                 "--file",
                 str(export_file),
@@ -496,12 +496,12 @@ class TestWorkflowGateMessages:
     def test_confirm_skip_full_name_scan_succeeds(self, tmp_path, monkeypatch, capsys):
         export_file = tmp_path / "export.jsonl"
         export_file.write_text('{"project":"p","model":"m","messages":[]}\n')
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {})
-        monkeypatch.setattr("clawtrace.cli.save_config", lambda _c: None)
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {})
+        monkeypatch.setattr("agentstrace.cli.save_config", lambda _c: None)
         monkeypatch.setattr(
             "sys.argv",
             [
-                "clawtrace",
+                "agentstrace",
                 "confirm",
                 "--file",
                 str(export_file),
@@ -520,8 +520,8 @@ class TestWorkflowGateMessages:
         assert payload["full_name_scan"]["skipped"] is True
 
     def test_push_before_confirm_shows_step_process(self, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"stage": "review", "source": "all"})
-        monkeypatch.setattr("sys.argv", ["clawtrace", "export", "--push"])
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"stage": "review", "source": "all"})
+        monkeypatch.setattr("sys.argv", ["agentstrace", "export", "--push"])
         with pytest.raises(SystemExit):
             main()
         payload = self._extract_json(capsys.readouterr().out)
@@ -529,9 +529,9 @@ class TestWorkflowGateMessages:
         assert "hint" in payload
 
     def test_export_requires_project_confirmation_with_full_flow(self, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli._has_session_sources", lambda _src: True)
+        monkeypatch.setattr("agentstrace.cli._has_session_sources", lambda _src: True)
         monkeypatch.setattr(
-            "clawtrace.cli.discover_projects",
+            "agentstrace.cli.discover_projects",
             lambda: [
                 {
                     "display_name": "proj1",
@@ -541,15 +541,15 @@ class TestWorkflowGateMessages:
                 }
             ],
         )
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"source": "all"})
-        monkeypatch.setattr("sys.argv", ["clawtrace", "export", "--no-push"])
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"source": "all"})
+        monkeypatch.setattr("sys.argv", ["agentstrace", "export", "--no-push"])
         with pytest.raises(SystemExit):
             main()
         payload = self._extract_json(capsys.readouterr().out)
         assert payload["error"] == "Project selection is not confirmed yet."
         assert payload["blocked_on_step"] == "Step 3/5"
         assert len(payload["process_steps"]) == 5
-        assert "prep && clawtrace list" in payload["process_steps"][0]
+        assert "prep && agentstrace list" in payload["process_steps"][0]
         assert payload["required_action"].startswith("Send the full project/folder list")
         assert "in a message" in payload["required_action"]
         assert isinstance(payload["projects"], list)
@@ -557,8 +557,8 @@ class TestWorkflowGateMessages:
         assert payload["projects"][0]["sessions"] == 2
 
     def test_export_requires_explicit_source_selection(self, monkeypatch, capsys):
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {})
-        monkeypatch.setattr("sys.argv", ["clawtrace", "export", "--no-push"])
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {})
+        monkeypatch.setattr("sys.argv", ["agentstrace", "export", "--no-push"])
         with pytest.raises(SystemExit):
             main()
         payload = self._extract_json(capsys.readouterr().out)
@@ -566,7 +566,7 @@ class TestWorkflowGateMessages:
         assert payload["blocked_on_step"] == "Step 2/5"
         assert len(payload["process_steps"]) == 5
         assert payload["allowed_sources"] == ["all", "both", "claude", "codex", "custom", "gemini", "kimi", "openclaw", "opencode"]
-        assert payload["next_command"] == "clawtrace config --source all"
+        assert payload["next_command"] == "agentstrace config --source all"
 
     def test_configure_next_steps_require_full_folder_presentation(self):
         steps, _next = _build_status_next_steps(
@@ -575,7 +575,7 @@ class TestWorkflowGateMessages:
             "alice",
             "alice/my-personal-codex-data",
         )
-        assert any("clawtrace list" in step for step in steps)
+        assert any("agentstrace list" in step for step in steps)
         assert any("FULL project/folder list" in step for step in steps)
         assert any("in your next message" in step for step in steps)
         assert any("source scope" in step.lower() for step in steps)
@@ -732,11 +732,11 @@ class TestScanPiiHighEntropy:
 @pytest.fixture
 def bundle_index(tmp_path, monkeypatch):
     """Set up an index DB with sessions for bundle testing."""
-    monkeypatch.setattr("clawtrace.index.INDEX_DB", tmp_path / "index.db")
-    monkeypatch.setattr("clawtrace.index.BLOBS_DIR", tmp_path / "blobs")
-    monkeypatch.setattr("clawtrace.index.CONFIG_DIR", tmp_path / "clawtrace_config")
+    monkeypatch.setattr("agentstrace.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("agentstrace.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("agentstrace.index.CONFIG_DIR", tmp_path / "agentstrace_config")
 
-    from clawtrace.index import open_index, upsert_sessions
+    from agentstrace.index import open_index, upsert_sessions
 
     conn = open_index()
     sessions = [
@@ -757,7 +757,7 @@ def bundle_index(tmp_path, monkeypatch):
     upsert_sessions(conn, sessions)
 
     # Approve sessions for bundle testing
-    from clawtrace.index import update_session
+    from agentstrace.index import update_session
     for i in range(3):
         update_session(conn, f"sess-{i}", status="approved")
     conn.close()
@@ -766,7 +766,7 @@ def bundle_index(tmp_path, monkeypatch):
 
 class TestBundleCreate:
     def test_create_by_ids(self, bundle_index, capsys):
-        from clawtrace.cli import _run_bundle_create
+        from agentstrace.cli import _run_bundle_create
         args = MagicMock(session_ids=["sess-0", "sess-1"], status=None,
                          note="test", attestation=None, json=True)
         _run_bundle_create(args)
@@ -776,14 +776,14 @@ class TestBundleCreate:
         assert "bundle_id" in output
 
     def test_create_by_status(self, bundle_index, capsys):
-        from clawtrace.cli import _run_bundle_create
+        from agentstrace.cli import _run_bundle_create
         args = MagicMock(session_ids=[], status="approved", note=None, attestation=None, json=True)
         _run_bundle_create(args)
         output = json.loads(capsys.readouterr().out)
         assert output["session_count"] == 3
 
     def test_create_no_sessions_exits(self, bundle_index):
-        from clawtrace.cli import _run_bundle_create
+        from agentstrace.cli import _run_bundle_create
         args = MagicMock(session_ids=[], status=None, note=None, attestation=None)
         with pytest.raises(SystemExit):
             _run_bundle_create(args)
@@ -791,26 +791,26 @@ class TestBundleCreate:
 
 class TestBundleList:
     def test_list_empty(self, bundle_index, capsys):
-        from clawtrace.cli import _run_bundle_list
+        from agentstrace.cli import _run_bundle_list
         _run_bundle_list(MagicMock(json=True))
         output = json.loads(capsys.readouterr().out)
         assert output["total"] == 0
         assert output["bundles"] == []
 
     def test_list_after_create(self, bundle_index, capsys):
-        from clawtrace.index import create_bundle, open_index
+        from agentstrace.index import create_bundle, open_index
         conn = open_index()
         create_bundle(conn, ["sess-0"], note="test")
         conn.close()
 
-        from clawtrace.cli import _run_bundle_list
+        from agentstrace.cli import _run_bundle_list
         _run_bundle_list(MagicMock(json=True))
         output = json.loads(capsys.readouterr().out)
         assert output["total"] == 1
         assert output["bundles"][0]["session_count"] == 1
 
     def test_list_human(self, bundle_index, capsys):
-        from clawtrace.cli import _run_bundle_list
+        from agentstrace.cli import _run_bundle_list
         _run_bundle_list(MagicMock(json=False))
         out = capsys.readouterr().out
         assert "No bundles" in out
@@ -818,12 +818,12 @@ class TestBundleList:
 
 class TestBundleView:
     def test_view(self, bundle_index, capsys):
-        from clawtrace.index import create_bundle, open_index
+        from agentstrace.index import create_bundle, open_index
         conn = open_index()
         bundle_id = create_bundle(conn, ["sess-0", "sess-1"])
         conn.close()
 
-        from clawtrace.cli import _run_bundle_view
+        from agentstrace.cli import _run_bundle_view
         args = MagicMock(bundle_id=bundle_id, json=True)
         _run_bundle_view(args)
         output = json.loads(capsys.readouterr().out)
@@ -831,19 +831,19 @@ class TestBundleView:
         assert len(output["sessions"]) == 2
 
     def test_view_prefix(self, bundle_index, capsys):
-        from clawtrace.index import create_bundle, open_index
+        from agentstrace.index import create_bundle, open_index
         conn = open_index()
         bundle_id = create_bundle(conn, ["sess-0"])
         conn.close()
 
-        from clawtrace.cli import _run_bundle_view
+        from agentstrace.cli import _run_bundle_view
         args = MagicMock(bundle_id=bundle_id[:8], json=True)
         _run_bundle_view(args)
         output = json.loads(capsys.readouterr().out)
         assert output["bundle_id"] == bundle_id
 
     def test_view_not_found(self, bundle_index):
-        from clawtrace.cli import _run_bundle_view
+        from agentstrace.cli import _run_bundle_view
         args = MagicMock(bundle_id="nonexistent")
         with pytest.raises(SystemExit):
             _run_bundle_view(args)
@@ -851,12 +851,12 @@ class TestBundleView:
 
 class TestBundleExport:
     def test_export(self, bundle_index, capsys):
-        from clawtrace.index import create_bundle, open_index
+        from agentstrace.index import create_bundle, open_index
         conn = open_index()
         bundle_id = create_bundle(conn, ["sess-0", "sess-1"])
         conn.close()
 
-        from clawtrace.cli import _run_bundle_export
+        from agentstrace.cli import _run_bundle_export
         args = MagicMock(bundle_id=bundle_id, output=None, json=True)
         _run_bundle_export(args)
         output = json.loads(capsys.readouterr().out)
@@ -866,11 +866,11 @@ class TestBundleExport:
 
     def test_export_redacts_custom_strings(self, tmp_path, monkeypatch, capsys):
         """Bundle export applies redact_strings from config."""
-        monkeypatch.setattr("clawtrace.index.INDEX_DB", tmp_path / "index.db")
-        monkeypatch.setattr("clawtrace.index.BLOBS_DIR", tmp_path / "blobs")
-        monkeypatch.setattr("clawtrace.index.CONFIG_DIR", tmp_path / "clawtrace_config")
+        monkeypatch.setattr("agentstrace.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("agentstrace.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("agentstrace.index.CONFIG_DIR", tmp_path / "agentstrace_config")
 
-        from clawtrace.index import create_bundle, open_index, upsert_sessions
+        from agentstrace.index import create_bundle, open_index, upsert_sessions
 
         conn = open_index()
         sessions = [
@@ -889,15 +889,15 @@ class TestBundleExport:
         ]
         upsert_sessions(conn, sessions)
 
-        from clawtrace.index import update_session
+        from agentstrace.index import update_session
         update_session(conn, "redact-test", status="approved")
         bundle_id = create_bundle(conn, ["redact-test"])
         conn.close()
 
         # Configure redact_strings — patch in cli's namespace where load_config is bound
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {"redact_strings": ["MySecretName"]})
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {"redact_strings": ["MySecretName"]})
 
-        from clawtrace.cli import _run_bundle_export
+        from agentstrace.cli import _run_bundle_export
         args = MagicMock(bundle_id=bundle_id, output=None, json=True)
         _run_bundle_export(args)
         output = json.loads(capsys.readouterr().out)
@@ -911,7 +911,7 @@ class TestBundleExport:
 
 class TestSearch:
     def test_search_json(self, bundle_index, capsys):
-        from clawtrace.cli import _run_search
+        from agentstrace.cli import _run_search
         args = MagicMock(query="Task", limit=20, source=None, json=True)
         _run_search(args)
         output = json.loads(capsys.readouterr().out)
@@ -920,7 +920,7 @@ class TestSearch:
         assert "results" in output
 
     def test_search_table(self, bundle_index, capsys):
-        from clawtrace.cli import _run_search
+        from agentstrace.cli import _run_search
         args = MagicMock(query="zzzznonexistent", limit=20, source=None, json=False)
         _run_search(args)
         out = capsys.readouterr().out
@@ -935,13 +935,13 @@ class TestShareHelpers:
         assert payload["sessions"][0]["session_id"] == "s1"
 
     def test_share_pii_status_warns_without_export(self, monkeypatch):
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {})
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {})
         status = _share_pii_status()
         assert status["level"] == "warn"
         assert "No recent export record" in status["message"]
 
     def test_share_pii_status_info_with_sanitized(self, monkeypatch):
-        monkeypatch.setattr("clawtrace.cli.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.cli.load_config", lambda: {
             "last_export": {
                 "output_file": "/tmp/a.jsonl",
                 "pii_review": {"finding_count": 3},
@@ -956,15 +956,15 @@ class TestShareHelpers:
 class TestShare:
     def test_share_approved(self, bundle_index, capsys, monkeypatch):
         """share --status approved creates bundle + exports + shares."""
-        from clawtrace.cli import _run_share
+        from agentstrace.cli import _run_share
 
         def mock_share_bundle(conn, bundle_id, *, force=False, custom_strings=None):
             return {"ok": True, "session_count": 3, "bundle_hash": "abc123",
                     "shared_at": "2026-01-01",
                     "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}}}
 
-        # _run_share imports share_bundle from clawtrace.daemon at call time
-        monkeypatch.setattr("clawtrace.daemon.share_bundle", mock_share_bundle)
+        # _run_share imports share_bundle from agentstrace.daemon at call time
+        monkeypatch.setattr("agentstrace.daemon.share_bundle", mock_share_bundle)
 
         args = MagicMock(session_ids=[], status="approved", note="test",
                          force=False, json=False, preview=False)
@@ -977,7 +977,7 @@ class TestShare:
 
     def test_share_preview(self, bundle_index, capsys):
         """share --preview shows session list without uploading."""
-        from clawtrace.cli import _run_share
+        from agentstrace.cli import _run_share
         args = MagicMock(session_ids=[], status="approved", note=None,
                          force=False, json=False, preview=True)
         _run_share(args)
@@ -987,10 +987,10 @@ class TestShare:
 
 class TestScore:
     def test_score_single_session_returns_error_on_judge_failure(self, monkeypatch):
-        from clawtrace.cli import _score_single_session
+        from agentstrace.cli import _score_single_session
 
         monkeypatch.setattr(
-            "clawtrace.scoring.score_session",
+            "agentstrace.scoring.score_session",
             lambda conn, session_id, model=None, backend="auto": (_ for _ in ()).throw(RuntimeError("backend auth failed")),
         )
 
@@ -999,7 +999,7 @@ class TestScore:
         assert "Judge failed: backend auth failed" in result["error"]
 
     def test_score_help_includes_default_limit_10(self, capsys, monkeypatch):
-        monkeypatch.setattr(sys, "argv", ["clawtrace", "score", "--help"])
+        monkeypatch.setattr(sys, "argv", ["agentstrace", "score", "--help"])
         with pytest.raises(SystemExit) as excinfo:
             main()
         assert excinfo.value.code == 0
@@ -1008,7 +1008,7 @@ class TestScore:
 
     def test_share_preview_json(self, bundle_index, capsys):
         """share --preview --json outputs session list as JSON."""
-        from clawtrace.cli import _run_share
+        from agentstrace.cli import _run_share
         args = MagicMock(session_ids=[], status="approved", note=None,
                          force=False, json=True, preview=True)
         _run_share(args)
@@ -1017,7 +1017,7 @@ class TestScore:
         assert output["total"] == 3
 
     def test_share_no_sessions_exits(self, bundle_index):
-        from clawtrace.cli import _run_share
+        from agentstrace.cli import _run_share
         args = MagicMock(session_ids=[], status=None, note=None,
                          force=False, json=False, preview=False)
         with pytest.raises(SystemExit):
@@ -1037,7 +1037,7 @@ class TestPiiCli:
         }
         input_file.write_text(json.dumps(session) + "\n")
 
-        monkeypatch.setattr("clawtrace.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [
+        monkeypatch.setattr("agentstrace.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [
             {
                 "session_id": "s1",
                 "message_index": 0,
@@ -1073,7 +1073,7 @@ class TestPiiCli:
             },
         ])
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--json",
@@ -1084,7 +1084,7 @@ class TestPiiCli:
         assert review_output["finding_count"] >= 3
 
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-apply",
+            "agentstrace", "pii-apply",
             "--file", str(input_file),
             "--findings", str(findings_file),
             "--output", str(output_file),
@@ -1098,7 +1098,7 @@ class TestPiiCli:
         assert "kaidagent" not in json.dumps(data)
 
     def _make_ai_provider_mock(self, monkeypatch):
-        monkeypatch.setattr("clawtrace.cli.review_session_pii_with_agent", lambda session, **kw: [{
+        monkeypatch.setattr("agentstrace.cli.review_session_pii_with_agent", lambda session, **kw: [{
             "session_id": "s1",
             "message_index": 0,
             "field": "content",
@@ -1116,7 +1116,7 @@ class TestPiiCli:
         input_file.write_text(json.dumps({"session_id": "s1", "messages": [{"content": "Kai D"}]}) + "\n")
         self._make_ai_provider_mock(monkeypatch)
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "ai",
@@ -1134,7 +1134,7 @@ class TestPiiCli:
         input_file.write_text(json.dumps({"session_id": "s1", "messages": [{"content": "Kai D"}]}) + "\n")
         self._make_ai_provider_mock(monkeypatch)
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "claude",
@@ -1149,7 +1149,7 @@ class TestPiiCli:
         input_file = tmp_path / "input.jsonl"
         findings_file = tmp_path / "findings.json"
         input_file.write_text(json.dumps({"session_id": "s1", "messages": [{"content": '{"name":"Kai D"}'}]}) + "\n")
-        monkeypatch.setattr("clawtrace.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [{
+        monkeypatch.setattr("agentstrace.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [{
             "session_id": "s1",
             "message_index": 0,
             "field": "content",
@@ -1161,7 +1161,7 @@ class TestPiiCli:
             "source": "rule",
         }])
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "hybrid",
@@ -1173,7 +1173,7 @@ class TestPiiCli:
         assert output["finding_count"] == 1
 
     def test_apply_pii_findings_helper(self, tmp_path):
-        from clawtrace.cli import _apply_pii_findings
+        from agentstrace.cli import _apply_pii_findings
         input_file = tmp_path / "input.jsonl"
         findings_file = tmp_path / "findings.json"
         output_file = tmp_path / "output.jsonl"
@@ -1196,7 +1196,7 @@ class TestPiiCli:
         findings_file = tmp_path / "findings.json"
         input_file.write_text(json.dumps({"session_id": "s1", "messages": []}) + "\n")
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "codex",
@@ -1215,9 +1215,9 @@ class TestPiiCli:
             called_backends.append(backend)
             return []
 
-        monkeypatch.setattr("clawtrace.cli.review_session_pii_with_agent", fake_agent_review)
+        monkeypatch.setattr("agentstrace.cli.review_session_pii_with_agent", fake_agent_review)
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "ai",
@@ -1235,9 +1235,9 @@ class TestPiiCli:
             json.dumps({"session_id": "abc123", "messages": [{"content": "x"}]}) + "\n"
             + json.dumps({"session_id": "def456", "messages": [{"content": "y"}]}) + "\n"
         )
-        monkeypatch.setattr("clawtrace.cli.review_session_pii_with_agent", lambda s, **kw: [])
+        monkeypatch.setattr("agentstrace.cli.review_session_pii_with_agent", lambda s, **kw: [])
         monkeypatch.setattr("sys.argv", [
-            "clawtrace", "pii-review",
+            "agentstrace", "pii-review",
             "--file", str(input_file),
             "--output", str(findings_file),
             "--provider", "ai",

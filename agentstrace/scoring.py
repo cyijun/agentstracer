@@ -3,7 +3,7 @@
 Implements: Format → Judge → Store
 See docs/scoring-algorithm.md for the full specification.
 
-All scoring judgment lives in the rubric (skills/clawtrace-score/RUBRIC.md).
+All scoring judgment lives in the rubric (skills/agentstrace-score/RUBRIC.md).
 Python code handles formatting, calling the judge, and storing results. Zero scoring logic.
 """
 
@@ -356,7 +356,7 @@ def format_session_for_judge(
 # ---------------------------------------------------------------------------
 
 _RUBRIC_SEARCH_PATHS = [
-    Path(__file__).parent.parent / "skills" / "clawtrace-score" / "RUBRIC.md",
+    Path(__file__).parent.parent / "skills" / "agentstrace-score" / "RUBRIC.md",
 ]
 
 _FALLBACK_RUBRIC = """\
@@ -647,7 +647,7 @@ def _call_judge_with_openclaw(
 ) -> dict:
     """Score a session through OpenClaw's headless one-turn agent CLI."""
     if model:
-        raise RuntimeError("OpenClaw backend does not support --model override from clawtrace")
+        raise RuntimeError("OpenClaw backend does not support --model override from agentstrace")
 
     _check_backend_runtime("openclaw")
     command = _require_backend_command("openclaw")

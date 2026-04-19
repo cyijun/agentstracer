@@ -10,18 +10,18 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from clawtrace.daemon import WorkbenchHandler, run_server, _SHARE_COOLDOWN_SECONDS
-from clawtrace.index import open_index, upsert_sessions
+from agentstrace.daemon import WorkbenchHandler, run_server, _SHARE_COOLDOWN_SECONDS
+from agentstrace.index import open_index, upsert_sessions
 
 
 @pytest.fixture
 def index_setup(tmp_path, monkeypatch):
     """Set up an index DB in a temp directory and seed it."""
-    monkeypatch.setattr("clawtrace.index.INDEX_DB", tmp_path / "index.db")
-    monkeypatch.setattr("clawtrace.index.BLOBS_DIR", tmp_path / "blobs")
-    monkeypatch.setattr("clawtrace.index.CONFIG_DIR", tmp_path / "clawtrace_config")
-    monkeypatch.setattr("clawtrace.daemon.CONFIG_DIR", tmp_path / "clawtrace_config")
-    monkeypatch.setattr("clawtrace.daemon.FRONTEND_DIST", tmp_path / "nonexistent_dist")
+    monkeypatch.setattr("agentstrace.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("agentstrace.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("agentstrace.index.CONFIG_DIR", tmp_path / "agentstrace_config")
+    monkeypatch.setattr("agentstrace.daemon.CONFIG_DIR", tmp_path / "agentstrace_config")
+    monkeypatch.setattr("agentstrace.daemon.FRONTEND_DIST", tmp_path / "nonexistent_dist")
 
     conn = open_index()
     sessions = [
@@ -168,7 +168,7 @@ class TestStaticServing:
         resp = conn.getresponse()
         body = resp.read().decode()
         assert resp.status == 200
-        assert "ClawTrace Workbench" in body
+        assert "AgentsTrace Workbench" in body
 
 
 class TestRunServerPortFallback:
@@ -189,8 +189,8 @@ class TestRunServerPortFallback:
                 raise OSError("Address already in use")
             return real_server
 
-        with patch("clawtrace.daemon.ThreadingHTTPServer", side_effect=fake_init), \
-             patch("clawtrace.daemon.Scanner"), \
+        with patch("agentstrace.daemon.ThreadingHTTPServer", side_effect=fake_init), \
+             patch("agentstrace.daemon.Scanner"), \
              patch("webbrowser.open") as mock_open:
             run_server(port=8384, open_browser=True)
 
@@ -253,11 +253,11 @@ class TestShareAPI:
         bundle_id = self._create_and_export_bundle(server)
 
         mock_urlopen = _mock_urlopen_factory()
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 200
@@ -275,12 +275,12 @@ class TestShareAPI:
 
         bundle_id = self._create_and_export_bundle(server)
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
         mock_urlopen = _mock_urlopen_factory()
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
         assert status == 200
 
@@ -295,12 +295,12 @@ class TestShareAPI:
 
         bundle_id = self._create_and_export_bundle(server)
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
         mock_urlopen = _mock_urlopen_factory()
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, _ = _post(server, f"/api/bundles/{bundle_id}/share")
         assert status == 200
 
@@ -312,7 +312,7 @@ class TestShareAPI:
 
         # With force=true → should re-share
         WorkbenchHandler._last_share_time = 0.0
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share", {"force": True})
         assert status == 200
         assert data["ok"] is True
@@ -332,12 +332,12 @@ class TestShareAPI:
             fp=error_resp,
         )
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
         mock_urlopen = _mock_urlopen_factory(upload_error=http_error)
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 502
@@ -358,12 +358,12 @@ class TestShareAPI:
             fp=error_resp,
         )
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
         mock_urlopen = _mock_urlopen_factory(upload_error=http_error)
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 200
@@ -379,12 +379,12 @@ class TestShareAPI:
 
         network_error = urllib.error.URLError("Connection refused")
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "test-dev-id",
             "device_token": "test-dev-token",
         })
         mock_urlopen = _mock_urlopen_factory(upload_error=network_error)
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 502
@@ -403,11 +403,11 @@ class TestShareAPI:
         def tracking_save(config):
             saved_configs.append(dict(config))
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", original_load)
-        monkeypatch.setattr("clawtrace.daemon.save_config", tracking_save)
+        monkeypatch.setattr("agentstrace.daemon.load_config", original_load)
+        monkeypatch.setattr("agentstrace.daemon.save_config", tracking_save)
 
         mock_urlopen = _mock_urlopen_factory()
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 200
@@ -422,7 +422,7 @@ class TestShareAPI:
 
         bundle_id = self._create_and_export_bundle(server)
 
-        monkeypatch.setattr("clawtrace.daemon.load_config", lambda: {
+        monkeypatch.setattr("agentstrace.daemon.load_config", lambda: {
             "device_id": "existing-device-id",
             "device_token": "existing-device-token",
         })
@@ -441,7 +441,7 @@ class TestShareAPI:
             resp.__exit__ = MagicMock(return_value=False)
             return resp
 
-        with patch("clawtrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("agentstrace.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             status, data = _post(server, f"/api/bundles/{bundle_id}/share")
 
         assert status == 200

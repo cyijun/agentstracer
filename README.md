@@ -1,4 +1,4 @@
-# ClawTrace (Local-Only Fork)
+# AgentsTrace (Local-Only Fork)
 
 原版：[kaiaiagent/clawtrace](https://github.com/kaiaiagent/clawtrace)
 
@@ -9,8 +9,14 @@
 ### 安装
 
 ```bash
-git clone https://github.com/cyijun/clawtrace-local.git
-cd clawtrace-local
+pip install agentstracer
+```
+
+或从源码安装：
+
+```bash
+git clone https://github.com/cyijun/agentstrace.git
+cd agentstrace
 pip install -e .
 ```
 
@@ -18,20 +24,20 @@ pip install -e .
 
 ```bash
 # 1. 配置导出源（claude/kimi/codex/gemini/all）
-clawtrace config --source all
+agentstrace config --source all
 
 # 2. 导出对话记录
-clawtrace export --no-push -o my_conversations.jsonl
+agentstrace export --no-push -o my_conversations.jsonl
 ```
 
 ### 私人使用（保留 API Keys）
 
 ```bash
 # 禁用 secrets 脱敏（仅建议本地私人使用）
-clawtrace config --no-secrets-redaction
+agentstrace config --no-secrets-redaction
 
 # 导出（包含原始 API keys）
-clawtrace export --no-push -o my_data.jsonl
+agentstrace export --no-push -o my_data.jsonl
 
 # ⚠️ 警告：此文件包含明文 API keys，请勿分享！
 ```
@@ -40,13 +46,13 @@ clawtrace export --no-push -o my_data.jsonl
 
 ```bash
 # 列出发现的项目
-clawtrace list
+agentstrace list
 
 # 启动本地 Web UI
-clawtrace serve
+agentstrace serve
 
 # 查看配置
-clawtrace config
+agentstrace config
 ```
 
 ---
@@ -106,7 +112,7 @@ clawtrace config
 
 ## 关于本版本
 
-这是 [ClawTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，专注于**本地隐私保护**和**纯离线使用**。
+这是 [AgentsTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，专注于**本地隐私保护**和**纯离线使用**。
 
 ### 主要修改点
 

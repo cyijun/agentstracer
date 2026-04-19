@@ -1,8 +1,8 @@
-"""Tests for clawtrace.anonymizer — PII anonymization."""
+"""Tests for agentstrace.anonymizer — PII anonymization."""
 
 import pytest
 
-from clawtrace.anonymizer import (
+from agentstrace.anonymizer import (
     Anonymizer,
     _hash_username,
     _replace_username,
@@ -181,7 +181,7 @@ class TestAnonymizer:
 
     def test_extra_usernames(self, monkeypatch):
         monkeypatch.setattr(
-            "clawtrace.anonymizer._detect_home_dir",
+            "agentstrace.anonymizer._detect_home_dir",
             lambda: ("/Users/testuser", "testuser"),
         )
         anon = Anonymizer(extra_usernames=["github_handle"])
@@ -190,7 +190,7 @@ class TestAnonymizer:
 
     def test_extra_usernames_dedup(self, monkeypatch):
         monkeypatch.setattr(
-            "clawtrace.anonymizer._detect_home_dir",
+            "agentstrace.anonymizer._detect_home_dir",
             lambda: ("/Users/testuser", "testuser"),
         )
         # Primary username in extra list should be skipped (not duplicated)

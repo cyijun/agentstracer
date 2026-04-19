@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "clawtrace"
+name = "agentstracer"
 version = "1.0.0"
 description = "Review, score, and curate your coding agent conversation traces locally"
 requires-python = ">=3.10"
@@ -26,13 +26,17 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-clawtrace = "clawtrace.cli:main"
+agentstrace = "agentstrace.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["clawtrace*"]
+include = ["agentstrace*"]
 
 [tool.setuptools.package-data]
-"clawtrace" = ["web/frontend/dist/**/*"]
+"agentstrace" = ["web/frontend/dist/**/*"]
+
+[project.urls]
+Homepage = "https://github.com/cyijun/agentstrace"
+Repository = "https://github.com/cyijun/agentstrace"
 
 [project.optional-dependencies]
 dev = ["pytest"]

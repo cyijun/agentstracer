@@ -1,7 +1,7 @@
 """Shared backend detection and resolution for coding-agent CLIs.
 
 Used by both the scoring pipeline and PII review to auto-detect whether
-clawtrace is running under Claude Code, Codex, or OpenClaw and dispatch
+agentstrace is running under Claude Code, Codex, or OpenClaw and dispatch
 to the corresponding automation CLI.
 """
 
@@ -101,7 +101,7 @@ def detect_current_agent(env: dict[str, str] | None = None) -> str | None:
 def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) -> str:
     """Resolve 'auto' backend selection to a concrete backend name.
 
-    Priority: explicit value > CLAWTRACE_SCORER_BACKEND env > auto-detect.
+    Priority: explicit value > AGENTSTRACE_SCORER_BACKEND env > auto-detect.
     """
     env = os.environ if env is None else env
     requested = (backend or "auto").strip().lower()
@@ -110,11 +110,11 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
             raise RuntimeError(f"Unsupported backend: {backend}")
         return requested
 
-    override = (env.get("CLAWTRACE_SCORER_BACKEND") or "").strip().lower()
+    override = (env.get("AGENTSTRACE_SCORER_BACKEND") or "").strip().lower()
     if override:
         if override not in SUPPORTED_BACKENDS:
             raise RuntimeError(
-                f"Unsupported CLAWTRACE_SCORER_BACKEND value: {override}. "
+                f"Unsupported AGENTSTRACE_SCORER_BACKEND value: {override}. "
                 f"Use one of: {', '.join(SUPPORTED_BACKENDS)}."
             )
         return override
@@ -125,7 +125,7 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
 
     raise RuntimeError(
         "Could not detect the current agent. "
-        "Run clawtrace from a supported agent CLI, set CLAWTRACE_SCORER_BACKEND, "
+        "Run agentstrace from a supported agent CLI, set AGENTSTRACE_SCORER_BACKEND, "
         "or pass --backend explicitly."
     )
 
@@ -189,7 +189,7 @@ def format_codex_runtime_error(returncode: int, stderr: str, stdout: str = "") -
         return (
             "Codex runs through `codex exec` in non-interactive mode. "
             "This process could not reach the Codex backend from the current environment. "
-            "If you launched clawtrace inside a network-disabled Codex sandbox, "
+            "If you launched agentstrace inside a network-disabled Codex sandbox, "
             "rerun it from your host shell or with network access."
         )
 
@@ -202,7 +202,7 @@ def format_codex_runtime_error(returncode: int, stderr: str, stdout: str = "") -
         return (
             "Codex runs through `codex exec` in non-interactive mode. "
             "`codex exec` reuses saved CLI authentication by default; for automation, "
-            "run `codex login` or set `CODEX_API_KEY` before running clawtrace."
+            "run `codex login` or set `CODEX_API_KEY` before running agentstrace."
         )
 
     summary = summarize_process_error(stderr, stdout)

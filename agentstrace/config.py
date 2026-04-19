@@ -1,4 +1,4 @@
-"""Persistent config for ClawTrace — stored at ~/.clawtrace/config.json"""
+"""Persistent config for AgentsTrace — stored at ~/.agentstrace/config.json"""
 
 import json
 import os
@@ -7,11 +7,11 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict, cast
 
-CONFIG_DIR = Path.home() / ".clawtrace"
+CONFIG_DIR = Path.home() / ".agentstrace"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
-class ClawTraceConfig(TypedDict, total=False):
+class AgentsTraceConfig(TypedDict, total=False):
     """Expected shape of the config dict."""
 
     repo: str | None
@@ -33,7 +33,7 @@ class ClawTraceConfig(TypedDict, total=False):
     device_token: str | None
 
 
-DEFAULT_CONFIG: ClawTraceConfig = {
+DEFAULT_CONFIG: AgentsTraceConfig = {
     "repo": None,
     "source": None,
     "excluded_projects": [],
@@ -43,18 +43,18 @@ DEFAULT_CONFIG: ClawTraceConfig = {
 }
 
 
-def load_config() -> ClawTraceConfig:
+def load_config() -> AgentsTraceConfig:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
                 stored = json.load(f)
-            return cast(ClawTraceConfig, {**DEFAULT_CONFIG, **stored})
+            return cast(AgentsTraceConfig, {**DEFAULT_CONFIG, **stored})
         except (json.JSONDecodeError, OSError) as e:
             print(f"Warning: could not read {CONFIG_FILE}: {e}", file=sys.stderr)
-    return cast(ClawTraceConfig, dict(DEFAULT_CONFIG))
+    return cast(AgentsTraceConfig, dict(DEFAULT_CONFIG))
 
 
-def save_config(config: ClawTraceConfig) -> None:
+def save_config(config: AgentsTraceConfig) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")

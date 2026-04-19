@@ -1,4 +1,4 @@
-"""PII review/apply helpers for exported ClawTrace JSONL files."""
+"""PII review/apply helpers for exported AgentsTrace JSONL files."""
 
 from __future__ import annotations
 
@@ -258,7 +258,7 @@ Return ONLY valid JSON: an array of finding objects. No prose, no markdown fence
 - Public product/service names: GitHub, OpenAI, Anthropic, Telegram, Docker, AWS, GCP, Hugging Face, npm, PyPI
 - Localhost, 127.0.0.1, 0.0.0.0, example.com, test.com
 - Generic technical terms, function/class/variable names
-- Open-source project names (tensorflow, pytorch, react, clawtrace)
+- Open-source project names (tensorflow, pytorch, react, agentstrace)
 - Public documentation URLs
 - Version numbers, build IDs, commit SHAs, UUIDs
 - Standard paths (/usr/bin, /tmp, /etc)

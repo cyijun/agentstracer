@@ -1,8 +1,8 @@
-"""Tests for clawtrace.depth — depth-level formatting."""
+"""Tests for agentstrace.depth — depth-level formatting."""
 
 import pytest
 
-from clawtrace.depth import (
+from agentstrace.depth import (
     _command_category,
     _file_type_from_path,
     _parse_test_outcome,

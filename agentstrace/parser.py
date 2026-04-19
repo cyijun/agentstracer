@@ -45,7 +45,7 @@ KIMI_SESSIONS_DIR = KIMI_DIR / "sessions"
 KIMI_CONFIG_PATH = KIMI_DIR / "kimi.json"
 UNKNOWN_KIMI_CWD = "<unknown-cwd>"
 
-CUSTOM_DIR = Path.home() / ".clawtrace" / "custom"
+CUSTOM_DIR = Path.home() / ".agentstrace" / "custom"
 
 # --- Field classification for tool input anonymization ---
 # Fields containing filesystem paths -> anonymizer.path()
