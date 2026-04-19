@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from agentstrace.index import (
+from agentstracer.index import (
     add_policy,
     create_bundle,
     get_bundle,
@@ -24,8 +24,8 @@ from agentstrace.index import (
 @pytest.fixture
 def index_conn(tmp_path, monkeypatch):
     """Open an index DB in a temp directory."""
-    monkeypatch.setattr("agentstrace.index.INDEX_DB", tmp_path / "index.db")
-    monkeypatch.setattr("agentstrace.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("agentstracer.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("agentstracer.index.BLOBS_DIR", tmp_path / "blobs")
     conn = open_index()
     yield conn
     conn.close()

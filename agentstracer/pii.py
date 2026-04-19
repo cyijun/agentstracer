@@ -258,7 +258,7 @@ Return ONLY valid JSON: an array of finding objects. No prose, no markdown fence
 - Public product/service names: GitHub, OpenAI, Anthropic, Telegram, Docker, AWS, GCP, Hugging Face, npm, PyPI
 - Localhost, 127.0.0.1, 0.0.0.0, example.com, test.com
 - Generic technical terms, function/class/variable names
-- Open-source project names (tensorflow, pytorch, react, agentstrace)
+- Open-source project names (tensorflow, pytorch, react, agentstracer)
 - Public documentation URLs
 - Version numbers, build IDs, commit SHAs, UUIDs
 - Standard paths (/usr/bin, /tmp, /etc)

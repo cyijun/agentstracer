@@ -1,1 +1,1 @@
-recursive-include agentstrace/web/frontend/dist *
+recursive-include agentstracer/web/frontend/dist *

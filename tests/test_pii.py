@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from agentstrace.pii import (
+from agentstracer.pii import (
     _collect_text_work_items,
     _content_findings_for_text,
     _extract_json_array,
@@ -207,7 +207,7 @@ def test_review_session_pii_with_claude(monkeypatch):
             "source": "claude",
         }]
 
-    monkeypatch.setattr("agentstrace.pii._review_text_with_agent", fake_review)
+    monkeypatch.setattr("agentstracer.pii._review_text_with_agent", fake_review)
     findings = review_session_pii_with_claude(session)
     assert findings[0]["entity_text"] == "Kai D"
     assert findings[0]["source"] == "claude"
@@ -225,9 +225,9 @@ def test_review_session_pii_with_agent_dispatches_backend(monkeypatch):
         called_with.append(session_id)
         return []
 
-    monkeypatch.setattr("agentstrace.pii.resolve_backend", lambda b: "codex")
-    monkeypatch.setattr("agentstrace.pii.check_backend_runtime", lambda b: None)
-    monkeypatch.setattr("agentstrace.pii._PII_BATCH_RUNNERS", {"codex": fake_runner})
+    monkeypatch.setattr("agentstracer.pii.resolve_backend", lambda b: "codex")
+    monkeypatch.setattr("agentstracer.pii.check_backend_runtime", lambda b: None)
+    monkeypatch.setattr("agentstracer.pii._PII_BATCH_RUNNERS", {"codex": fake_runner})
     review_session_pii_with_agent(session, backend="codex")
     assert called_with == ["s1"]
 
@@ -238,7 +238,7 @@ def test_review_session_pii_hybrid_merges_rule_and_claude(monkeypatch):
         "messages": [{"content": '{"name":"Kai D","username":"kaidagent"} and Acme Labs'}],
     }
 
-    monkeypatch.setattr("agentstrace.pii.review_session_pii_with_agent", lambda s, backend="auto", ignore_errors=True, **kw: [{
+    monkeypatch.setattr("agentstracer.pii.review_session_pii_with_agent", lambda s, backend="auto", ignore_errors=True, **kw: [{
         "session_id": "s1",
         "message_index": 0,
         "field": "content",
@@ -425,8 +425,8 @@ def test_split_into_batches_splits_large():
 
 
 def test_review_text_with_agent_unsupported_backend(monkeypatch):
-    monkeypatch.setattr("agentstrace.pii.resolve_backend", lambda b: "gemini")
-    monkeypatch.setattr("agentstrace.pii.check_backend_runtime", lambda b: None)
+    monkeypatch.setattr("agentstracer.pii.resolve_backend", lambda b: "gemini")
+    monkeypatch.setattr("agentstracer.pii.check_backend_runtime", lambda b: None)
     with pytest.raises(RuntimeError, match="Unsupported PII backend"):
         _review_text_with_agent("s1", 0, "content", "test", backend="gemini")
 
@@ -438,25 +438,25 @@ def test_review_text_with_agent_unsupported_backend(monkeypatch):
 
 def test_review_session_pii_with_agent_raises_on_error(monkeypatch):
     session = {"session_id": "s1", "messages": [{"content": "test"}]}
-    monkeypatch.setattr("agentstrace.pii.resolve_backend", lambda b: "claude")
-    monkeypatch.setattr("agentstrace.pii.check_backend_runtime", lambda b: None)
+    monkeypatch.setattr("agentstracer.pii.resolve_backend", lambda b: "claude")
+    monkeypatch.setattr("agentstracer.pii.check_backend_runtime", lambda b: None)
 
     def failing_runner(*a, **kw):
         raise RuntimeError("backend crashed")
 
-    monkeypatch.setattr("agentstrace.pii._PII_BATCH_RUNNERS", {"claude": failing_runner})
+    monkeypatch.setattr("agentstracer.pii._PII_BATCH_RUNNERS", {"claude": failing_runner})
     with pytest.raises(RuntimeError, match="backend crashed"):
         review_session_pii_with_agent(session, backend="claude", ignore_errors=False)
 
 
 def test_review_session_pii_with_agent_ignores_errors(monkeypatch):
     session = {"session_id": "s1", "messages": [{"content": "test"}]}
-    monkeypatch.setattr("agentstrace.pii.resolve_backend", lambda b: "claude")
-    monkeypatch.setattr("agentstrace.pii.check_backend_runtime", lambda b: None)
+    monkeypatch.setattr("agentstracer.pii.resolve_backend", lambda b: "claude")
+    monkeypatch.setattr("agentstracer.pii.check_backend_runtime", lambda b: None)
 
     def failing_runner(*a, **kw):
         raise RuntimeError("backend crashed")
 
-    monkeypatch.setattr("agentstrace.pii._PII_BATCH_RUNNERS", {"claude": failing_runner})
+    monkeypatch.setattr("agentstracer.pii._PII_BATCH_RUNNERS", {"claude": failing_runner})
     findings = review_session_pii_with_agent(session, backend="claude", ignore_errors=True)
     assert findings == []

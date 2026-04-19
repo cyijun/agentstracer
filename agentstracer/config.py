@@ -1,4 +1,4 @@
-"""Persistent config for AgentsTrace — stored at ~/.agentstrace/config.json"""
+"""Persistent config for AgentsTrace — stored at ~/.agentstracer/config.json"""
 
 import json
 import os
@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict, cast
 
-CONFIG_DIR = Path.home() / ".agentstrace"
+CONFIG_DIR = Path.home() / ".agentstracer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 

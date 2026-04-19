@@ -201,7 +201,7 @@ def share_bundle(
     NOTE: Network features disabled - local-only mode.
     """
     return {
-        "error": "Network features are disabled. This is a local-only build of agentstrace.",
+        "error": "Network features are disabled. This is a local-only build of agentstracer.",
         "status": 503,
     }
 
@@ -559,7 +559,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_quick_share(self) -> None:
         """Combined create + share in one call."""
         _json_response(self, {
-            "error": "Network features are disabled. This is a local-only build of agentstrace.",
+            "error": "Network features are disabled. This is a local-only build of agentstracer.",
         }, 503)
 
     def _handle_list_bundles(self) -> None:
@@ -770,7 +770,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
             # Serve the zip
             date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-            filename = f"agentstrace-bundle-{bundle_id[:8]}-{date_str}.zip"
+            filename = f"agentstracer-bundle-{bundle_id[:8]}-{date_str}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -784,7 +784,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_share(self, bundle_id: str) -> None:
         """Share a bundle via the ingest service."""
         _json_response(self, {
-            "error": "Network features are disabled. This is a local-only build of agentstrace.",
+            "error": "Network features are disabled. This is a local-only build of agentstracer.",
         }, 503)
 
     def _handle_list_policies(self) -> None:
@@ -892,7 +892,7 @@ pre { background: #f0f0f0; padding: 12px; border-radius: 6px; overflow-x: auto; 
 <h1>AgentsTrace Workbench</h1>
 <p>The API is running. The frontend hasn't been built yet.</p>
 <p>To build the frontend:</p>
-<pre>cd agentstrace/web/frontend
+<pre>cd agentstracer/web/frontend
 npm install
 npm run build</pre>
 <p>API endpoints available:</p>

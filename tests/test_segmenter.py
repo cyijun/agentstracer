@@ -1,11 +1,11 @@
-"""Tests for agentstrace.segmenter — OpenClaw session segmentation."""
+"""Tests for agentstracer.segmenter — OpenClaw session segmentation."""
 
 import json
 import tempfile
 
 import pytest
 
-from agentstrace.segmenter import (
+from agentstracer.segmenter import (
     _build_exchanges,
     _classify_tool_mode,
     _detect_compaction_boundaries,
@@ -203,9 +203,9 @@ class TestDetectToolModeShifts:
 class TestDetectWorkspaceSwitches:
     def test_cd_command(self):
         msgs = [
-            _user("work on agentstrace"),
+            _user("work on agentstracer"),
             _assistant("", tool_uses=[
-                _tool_use("bash", {"command": "cd /Users/x/agentstrace && ls"}),
+                _tool_use("bash", {"command": "cd /Users/x/agentstracer && ls"}),
             ]),
             _user("now dataclaw"),
             _assistant("", tool_uses=[
@@ -218,7 +218,7 @@ class TestDetectWorkspaceSwitches:
         msgs = [
             _user("read file"),
             _assistant("", tool_uses=[
-                _tool_use("read", {"file_path": "/Users/x/agentstrace/src/main.py"}),
+                _tool_use("read", {"file_path": "/Users/x/agentstracer/src/main.py"}),
             ]),
             _user("read other file"),
             _assistant("", tool_uses=[
@@ -231,11 +231,11 @@ class TestDetectWorkspaceSwitches:
         msgs = [
             _user("read file"),
             _assistant("", tool_uses=[
-                _tool_use("bash", {"command": "cd /Users/x/agentstrace && ls"}),
+                _tool_use("bash", {"command": "cd /Users/x/agentstracer && ls"}),
             ]),
             _user("read other file"),
             _assistant("", tool_uses=[
-                _tool_use("read", {"file_path": "/Users/x/agentstrace/tests/test.py"}),
+                _tool_use("read", {"file_path": "/Users/x/agentstracer/tests/test.py"}),
             ]),
         ]
         assert _detect_workspace_switches(msgs) == []
@@ -390,11 +390,11 @@ class TestSegmentOpenclawSession:
             _assistant("23°C", "2026-03-21T09:00:30Z"),
             _user("What's gold at?", "2026-03-21T09:02:00Z"),
             _assistant("$2847", "2026-03-21T09:02:30Z"),
-            _user("Go to agentstrace, check failing tests", "2026-03-21T09:15:00Z"),
+            _user("Go to agentstracer, check failing tests", "2026-03-21T09:15:00Z"),
             _assistant("", "2026-03-21T09:15:30Z", tool_uses=[
-                _tool_use("bash", {"command": "cd /home/user/agentstrace && pytest"}),
-                _tool_use("read", {"file_path": "/home/user/agentstrace/tests/test_parser.py"}),
-                _tool_use("edit", {"file_path": "/home/user/agentstrace/tests/test_parser.py"}),
+                _tool_use("bash", {"command": "cd /home/user/agentstracer && pytest"}),
+                _tool_use("read", {"file_path": "/home/user/agentstracer/tests/test_parser.py"}),
+                _tool_use("edit", {"file_path": "/home/user/agentstracer/tests/test_parser.py"}),
                 _tool_use("bash", {"command": "pytest"}),
             ]),
             _user("Fix them", "2026-03-21T09:16:00Z"),
@@ -402,9 +402,9 @@ class TestSegmentOpenclawSession:
                 _tool_use("read"), _tool_use("edit"),
                 _tool_use("bash"), _tool_use("bash"),
             ]),
-            _user("Now go to dataclaw and install agentstrace", "2026-03-21T09:25:00Z"),
+            _user("Now go to dataclaw and install agentstracer", "2026-03-21T09:25:00Z"),
             _assistant("Installed", "2026-03-21T09:25:30Z", tool_uses=[
-                _tool_use("bash", {"command": "cd /home/user/dataclaw && pip install agentstrace"}),
+                _tool_use("bash", {"command": "cd /home/user/dataclaw && pip install agentstracer"}),
             ]),
             _user("What's the weather in Moscow?", "2026-03-21T10:00:00Z"),
             _assistant("-2°C, snow", "2026-03-21T10:00:30Z"),

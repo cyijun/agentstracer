@@ -1,16 +1,16 @@
-"""Tests for agentstrace.scoring — pure functions (no LLM calls)."""
+"""Tests for agentstracer.scoring — pure functions (no LLM calls)."""
 
 import json
 
 import pytest
 
-from agentstrace.backends import (
+from agentstracer.backends import (
     _classify_process_command,
     _detect_current_agent_from_env,
     check_backend_runtime as _check_backend_runtime,
     format_codex_runtime_error as _format_codex_runtime_error,
 )
-from agentstrace.scoring import (
+from agentstracer.scoring import (
     SCORING_BACKEND_CHOICES,
     SCORING_BACKEND_RUNNERS,
     Segment,
@@ -347,7 +347,7 @@ class TestBackendSelection:
 
     def test_call_judge_dispatches_to_codex(self, monkeypatch):
         monkeypatch.setenv("CODEX_THREAD_ID", "thread-123")
-        monkeypatch.setattr("agentstrace.scoring.load_scoring_rubric", lambda: "rubric")
+        monkeypatch.setattr("agentstracer.scoring.load_scoring_rubric", lambda: "rubric")
         monkeypatch.setitem(
             SCORING_BACKEND_RUNNERS,
             "codex",
@@ -393,7 +393,7 @@ class TestBackendSelection:
         assert "codex login" in message
 
     def test_call_judge_dispatches_to_openclaw(self, monkeypatch):
-        monkeypatch.setattr("agentstrace.scoring.load_scoring_rubric", lambda: "rubric")
+        monkeypatch.setattr("agentstracer.scoring.load_scoring_rubric", lambda: "rubric")
         monkeypatch.setitem(
             SCORING_BACKEND_RUNNERS,
             "openclaw",

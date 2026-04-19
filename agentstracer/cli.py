@@ -17,10 +17,10 @@ from .scoring import SCORING_BACKEND_CHOICES
 from .secrets import _has_mixed_char_types, _shannon_entropy, redact_session
 
 # HF DISABLED — retained for future re-enable
-HF_TAG = "agentstrace"
-REPO_URL = "https://github.com/cyijun/agentstrace"
+HF_TAG = "agentstracer"
+REPO_URL = "https://github.com/cyijun/agentstracer"
 # NOTE: SKILL download disabled - local-only mode
-# SKILL_URL = "https://raw.githubusercontent.com/kaiaiagent/clawtrace/main/skills/agentstrace/SKILL.md"
+# SKILL_URL = "https://raw.githubusercontent.com/kaiaiagent/clawtrace/main/skills/agentstracer/SKILL.md"
 
 REQUIRED_REVIEW_ATTESTATIONS: dict[str, str] = {
     "asked_full_name": "I asked the user for their full name and scanned for it.",
@@ -31,7 +31,7 @@ MIN_ATTESTATION_CHARS = 24
 MIN_MANUAL_SCAN_SESSIONS = 20
 
 CONFIRM_COMMAND_EXAMPLE = (
-    "agentstrace confirm "
+    "agentstracer confirm "
     "--full-name \"THEIR FULL NAME\" "
     "--attest-full-name \"Asked for full name and scanned export for THEIR FULL NAME.\" "
     "--attest-sensitive \"Asked about company/client/internal names and private URLs; user response recorded and redactions updated if needed.\" "
@@ -39,7 +39,7 @@ CONFIRM_COMMAND_EXAMPLE = (
 )
 
 CONFIRM_COMMAND_SKIP_FULL_NAME_EXAMPLE = (
-    "agentstrace confirm "
+    "agentstracer confirm "
     "--skip-full-name-scan "
     "--attest-full-name \"User declined to share full name; skipped exact-name scan.\" "
     "--attest-sensitive \"Asked about company/client/internal names and private URLs; user response recorded and redactions updated if needed.\" "
@@ -47,16 +47,16 @@ CONFIRM_COMMAND_SKIP_FULL_NAME_EXAMPLE = (
 )
 
 EXPORT_REVIEW_PUBLISH_STEPS = [
-    "Step 1/2: Export locally: agentstrace export --no-push --output /tmp/agentstrace_export.jsonl",
-    "Step 2/2: Review/redact, then confirm: agentstrace confirm ...",
+    "Step 1/2: Export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+    "Step 2/2: Review/redact, then confirm: agentstracer confirm ...",
 ]
 
 SETUP_TO_PUBLISH_STEPS = [
-    "Step 1/5: Run prep/list to review project scope: agentstrace prep && agentstrace list",
-    "Step 2/5: Explicitly choose source scope: agentstrace config --source <claude|codex|gemini|all>",
-    "Step 3/5: Configure exclusions/redactions and confirm projects: agentstrace config ...",
-    "Step 4/5: Export locally: agentstrace export --no-push --output /tmp/agentstrace_export.jsonl",
-    "Step 5/5: Review and confirm: agentstrace confirm ...",
+    "Step 1/5: Run prep/list to review project scope: agentstracer prep && agentstracer list",
+    "Step 2/5: Explicitly choose source scope: agentstracer config --source <claude|codex|gemini|all>",
+    "Step 3/5: Configure exclusions/redactions and confirm projects: agentstracer config ...",
+    "Step 4/5: Export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+    "Step 5/5: Review and confirm: agentstracer confirm ...",
 ]
 
 EXPLICIT_SOURCE_CHOICES = {"claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "all", "both"}
@@ -214,19 +214,19 @@ def _build_status_next_steps(
         configured_source = config.get("source")
         source_confirmed = _is_explicit_source_choice(configured_source)
         list_command = (
-            f"agentstrace list --source {configured_source}" if source_confirmed else "agentstrace list"
+            f"agentstracer list --source {configured_source}" if source_confirmed else "agentstracer list"
         )
         steps = []
         if not source_confirmed:
             steps.append(
                 "Ask the user to explicitly choose export source scope: Claude Code, Codex, Gemini, or all. "
-                "Then set it: agentstrace config --source <claude|codex|gemini|all>. "
+                "Then set it: agentstracer config --source <claude|codex|gemini|all>. "
                 "Do not run export until source scope is explicitly confirmed."
             )
         else:
             steps.append(
                 f"Source scope is currently set to '{configured_source}'. "
-                "If the user wants a different scope, run: agentstrace config --source <claude|codex|gemini|all>."
+                "If the user wants a different scope, run: agentstracer config --source <claude|codex|gemini|all>."
             )
         if not projects_confirmed:
             steps.append(
@@ -234,14 +234,14 @@ def _build_status_next_steps(
                 "(name, source, sessions, size, excluded), and ask which to EXCLUDE."
             )
             steps.append(
-                "Configure project scope: agentstrace config --exclude \"project1,project2\" "
-                "or agentstrace config --confirm-projects (to include all listed projects). "
+                "Configure project scope: agentstracer config --exclude \"project1,project2\" "
+                "or agentstracer config --confirm-projects (to include all listed projects). "
                 "Do not run export until this folder review is confirmed."
             )
         steps.extend([
             "Ask about GitHub/Discord usernames to anonymize and sensitive strings to redact. "
-            "Configure: agentstrace config --redact-usernames \"handle1\" and agentstrace config --redact \"string1\"",
-            "When done configuring, export locally: agentstrace export --no-push --output /tmp/agentstrace_export.jsonl",
+            "Configure: agentstracer config --redact-usernames \"handle1\" and agentstracer config --redact \"string1\"",
+            "When done configuring, export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
         ])
         # next_command is null because user input is needed before exporting
         return (steps, None)
@@ -251,23 +251,23 @@ def _build_status_next_steps(
             [
                 "Ask the user for their full name to run an exact-name privacy check against the export. If they decline, you may skip this check with --skip-full-name-scan and include a clear attestation.",
                 "Run PII scan commands and review results with the user.",
-                "Ask the user: 'Are there any company names, internal project names, client names, private URLs, or other people's names in your conversations that you'd want redacted? Any custom domains or internal tools?' Add anything they mention with agentstrace config --redact.",
+                "Ask the user: 'Are there any company names, internal project names, client names, private URLs, or other people's names in your conversations that you'd want redacted? Any custom domains or internal tools?' Add anything they mention with agentstracer config --redact.",
                 "Do a deep manual scan: sample ~20 sessions from the export (beginning, middle, end) and scan for names, private URLs, company names, credentials in conversation text, and anything else that looks sensitive. Report findings to the user.",
-                "If PII found in any of the above, add redactions (agentstrace config --redact) and re-export: agentstrace export --no-push",
+                "If PII found in any of the above, add redactions (agentstracer config --redact) and re-export: agentstracer export --no-push",
                 (
                     "Run: "
                     + CONFIRM_COMMAND_EXAMPLE
                     + " — scans for PII and shows project breakdown."
                 ),
             ],
-            "agentstrace confirm",
+            "agentstracer confirm",
         )
 
     if stage == "confirmed":
         return (
             [
                 "Review is complete. Export data is available locally.",
-                "To re-export with updated settings: agentstrace export --no-push",
+                "To re-export with updated settings: agentstracer export --no-push",
             ],
             None,
         )
@@ -275,8 +275,8 @@ def _build_status_next_steps(
     # done
     return (
         [
-            "Export complete. To update later: agentstrace export",
-            "To reconfigure: agentstrace prep then agentstrace config",
+            "Export complete. To update later: agentstracer export",
+            "To reconfigure: agentstracer prep then agentstracer config",
         ],
         None,
     )
@@ -563,7 +563,7 @@ task_categories:
 language:
   - en
 tags:
-  - agentstrace
+  - agentstracer
   - claude-code
   - codex-cli
   - gemini-cli
@@ -586,7 +586,7 @@ configs:
 
 Exported with [AgentsTrace]({REPO_URL}).
 
-**Tag: `agentstrace`** — [Browse all AgentsTrace datasets](https://huggingface.co/datasets?other=agentstrace)
+**Tag: `agentstracer`** — [Browse all AgentsTrace datasets](https://huggingface.co/datasets?other=agentstracer)
 
 ## Stats
 
@@ -657,15 +657,15 @@ ds = load_dataset("{repo_id}", split="train")
 ## Export your own
 
 ```bash
-pip install agentstrace
-agentstrace
+pip install agentstracer
+agentstracer
 ```
 """
 
 
 SKILL_TARGETS: dict[str, dict[str, str]] = {
     "claude": {
-        "dest_template": ".claude/skills/agentstrace/SKILL.md",
+        "dest_template": ".claude/skills/agentstracer/SKILL.md",
         "source_file": "SKILL.md",
         # NOTE: source_url removed - network download disabled
     },
@@ -678,14 +678,14 @@ SKILL_TARGETS: dict[str, dict[str, str]] = {
         "source_file": "SKILL.md",
     },
     "cline": {
-        "dest_template": ".cline/agentstrace/SKILL.md",
+        "dest_template": ".cline/agentstracer/SKILL.md",
         "source_file": "SKILL.md",
     },
 }
 
 
 def update_skill(target: str) -> None:
-    """Install the agentstrace skill for a coding agent from local bundle only."""
+    """Install the agentstracer skill for a coding agent from local bundle only."""
     target_config = SKILL_TARGETS.get(target)
     if not target_config:
         print(f"Error: unknown target '{target}'. Supported: {', '.join(SKILL_TARGETS)}", file=sys.stderr)
@@ -696,7 +696,7 @@ def update_skill(target: str) -> None:
 
     # NOTE: Network download disabled - local-only mode
     # Only use bundled local copy
-    bundled = Path(__file__).resolve().parent.parent / "skills" / "agentstrace" / target_config["source_file"]
+    bundled = Path(__file__).resolve().parent.parent / "skills" / "agentstracer" / target_config["source_file"]
     if bundled.exists():
         content = bundled.read_text()
     else:
@@ -709,11 +709,11 @@ def update_skill(target: str) -> None:
         "installed": str(dest),
         "target": target,
         "next_steps": [
-            "Run: agentstrace scan",
-            "Then: agentstrace inbox --json",
-            "Or open the full UI: agentstrace serve",
+            "Run: agentstracer scan",
+            "Then: agentstracer inbox --json",
+            "Or open the full UI: agentstracer serve",
         ],
-        "next_command": "agentstrace scan",
+        "next_command": "agentstracer scan",
     }, indent=2))
 
 
@@ -745,7 +745,7 @@ def _find_export_file(file_path: Path | None) -> Path:
     if file_path and file_path.exists():
         return file_path
     if file_path is None:
-        for c in [Path("/tmp/agentstrace_export.jsonl"), Path("agentstrace_conversations.jsonl")]:
+        for c in [Path("/tmp/agentstracer_export.jsonl"), Path("agentstracer_conversations.jsonl")]:
             if c.exists():
                 return c
     print(json.dumps({
@@ -753,7 +753,7 @@ def _find_export_file(file_path: Path | None) -> Path:
         "hint": "Run step 1 first to generate a local export file.",
         "blocked_on_step": "Step 1/2",
         "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-        "next_command": "agentstrace export --no-push --output /tmp/agentstrace_export.jsonl",
+        "next_command": "agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
     }, indent=2))
     sys.exit(1)
 
@@ -1172,7 +1172,7 @@ def confirm(
     if pii_findings:
         next_steps.append(
             "PII findings detected — review each one with the user. "
-            "If real: agentstrace config --redact \"string\" then re-export with --no-push. "
+            "If real: agentstracer config --redact \"string\" then re-export with --no-push. "
             "False positives can be ignored."
         )
     if "high_entropy_strings" in pii_findings:
@@ -1180,10 +1180,10 @@ def confirm(
             "High-entropy strings detected — these may be leaked secrets (API keys, tokens, "
             "passwords) that escaped automatic redaction. Review each one using the provided "
             "context snippets. If any are real secrets, redact with: "
-            "agentstrace config --redact \"the_secret\" then re-export with --no-push."
+            "agentstracer config --redact \"the_secret\" then re-export with --no-push."
         )
     next_steps.extend([
-        "If any project should be excluded, run: agentstrace config --exclude \"project_name\" and re-export with --no-push.",
+        "If any project should be excluded, run: agentstracer config --exclude \"project_name\" and re-export with --no-push.",
         f"Review is complete. {total} sessions ({_format_size(file_size)}) exported locally.",
     ])
 
@@ -1373,7 +1373,7 @@ def _run_inbox(
         return
 
     if not sessions:
-        print("No sessions found. Run `agentstrace scan` first.")
+        print("No sessions found. Run `agentstracer scan` first.")
         return
 
     # Print a compact table
@@ -1405,7 +1405,7 @@ def _run_inbox(
 
         print(f"{status_str:<12} {source_str:<10} {model:<25} {msgs:>5} {tokens:>8}  {title}{badge_str}")
 
-    print(f"\n{len(sessions)} sessions shown. Use `agentstrace serve` for the full review UI.")
+    print(f"\n{len(sessions)} sessions shown. Use `agentstracer serve` for the full review UI.")
 
 
 def _run_review_action(
@@ -2735,8 +2735,8 @@ def _run_segment(args: argparse.Namespace) -> None:
             "total_child_traces": total_children,
             "dry_run": dry_run,
             "results": results,
-            "next_steps": ["agentstrace score --batch --source openclaw"] if not dry_run else [
-                "agentstrace segment --source openclaw"
+            "next_steps": ["agentstracer score --batch --source openclaw"] if not dry_run else [
+                "agentstracer segment --source openclaw"
             ],
         }, indent=2))
     else:
@@ -2825,12 +2825,12 @@ def _run_recent(args: argparse.Namespace) -> None:
             "sessions": items,
             "auto_scanned": auto_scanned,
             "total_count": len(items),
-            "next_steps": ["agentstrace card <session_id> --depth summary --json"],
+            "next_steps": ["agentstracer card <session_id> --depth summary --json"],
         }, indent=2))
         return
 
     if not sessions:
-        print("No recent sessions found. Try `agentstrace scan` first.")
+        print("No recent sessions found. Try `agentstracer scan` first.")
         return
 
     # Human-readable list (one session per block for easy copy-paste of IDs)
@@ -2858,7 +2858,7 @@ def _run_recent(args: argparse.Namespace) -> None:
         print(f"     ID: {sid}")
         print()
 
-    print("Use: agentstrace card <session_id> to generate a share card")
+    print("Use: agentstracer card <session_id> to generate a share card")
 
 
 def _run_card(args: argparse.Namespace) -> None:
@@ -2924,7 +2924,7 @@ def main() -> None:
     list_parser = sub.add_parser("list", help="List all projects")
     list_parser.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
 
-    us = sub.add_parser("update-skill", help="Install/update the agentstrace skill for a coding agent")
+    us = sub.add_parser("update-skill", help="Install/update the agentstracer skill for a coding agent")
     us.add_argument("target", choices=["claude", "openclaw", "codex", "cline"],
                     help="Agent to install skill for")
 
@@ -3106,7 +3106,7 @@ def main() -> None:
     srch.add_argument("--json", action="store_true", help="Output JSON for agent parsing")
 
     exp = sub.add_parser("export", help="Export conversation data locally.")
-    # Export flags on both the subcommand and root parser so `agentstrace --push` works
+    # Export flags on both the subcommand and root parser so `agentstracer --push` works
     for target in (exp, parser):
         target.add_argument("--output", "-o", type=Path, default=None)
         target.add_argument("--repo", "-r", type=str, default=None)
@@ -3126,7 +3126,7 @@ def main() -> None:
         target.add_argument("--pii-backend", choices=list(BACKEND_CHOICES), default="auto",
                             help="Agent backend for AI-based PII review (default: auto = current agent's CLI)")
         target.add_argument("--push", action="store_true",
-                            help="Upload to Hugging Face after export (requires agentstrace confirm first)")
+                            help="Upload to Hugging Face after export (requires agentstracer confirm first)")
         target.add_argument("--no-push", action="store_true",
                             help="(Default, kept for backwards compatibility) Export locally only")
         target.add_argument(
@@ -3153,7 +3153,7 @@ def main() -> None:
     if command == "refinery":
         import sys as _sys
         import pathlib as _pathlib
-        # Ensure refinery package is importable (it lives alongside agentstrace)
+        # Ensure refinery package is importable (it lives alongside agentstracer)
         _repo_root = _pathlib.Path(__file__).resolve().parent.parent
         if str(_repo_root) not in _sys.path:
             _sys.path.insert(0, str(_repo_root))
@@ -3514,23 +3514,23 @@ def _run_export(args) -> None:
             ),
             "required_action": (
                 "Ask the user whether to export Claude Code, Codex, Gemini, or all. "
-                "Then run `agentstrace config --source <claude|codex|gemini|all>` "
+                "Then run `agentstracer config --source <claude|codex|gemini|all>` "
                 "or pass `--source <claude|codex|gemini|all>` on the export command."
             ),
             "allowed_sources": sorted(EXPLICIT_SOURCE_CHOICES),
             "blocked_on_step": "Step 2/5",
             "process_steps": SETUP_TO_PUBLISH_STEPS,
-            "next_command": "agentstrace config --source all",
+            "next_command": "agentstracer config --source all",
         }, indent=2))
         sys.exit(1)
 
-    # Gate: require `agentstrace confirm` before pushing
+    # Gate: require `agentstracer confirm` before pushing
     # Default is local-only. Push only when --push is explicitly passed.
     wants_push = getattr(args, "push", False) and not args.no_push
     if wants_push:
         print(json.dumps({
             "error": "Uploading to Hugging Face is temporarily disabled.",
-            "hint": "Use 'agentstrace export' to export locally.",
+            "hint": "Use 'agentstracer export' to export locally.",
         }, indent=2))
         sys.exit(1)
     if False:  # HF upload disabled — preserved for future re-enable
@@ -3541,18 +3541,18 @@ def _run_export(args) -> None:
                 "blocked_on_step": "Step 3/3",
                 "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
                 "next_command": (
-                    "agentstrace export --publish-attestation "
+                    "agentstracer export --publish-attestation "
                     "\"User explicitly approved publishing to Hugging Face on YYYY-MM-DD.\""
                 ),
             }, indent=2))
             sys.exit(1)
         if config.get("stage") != "confirmed":
             print(json.dumps({
-                "error": "You must run `agentstrace confirm` before pushing.",
-                "hint": "Export first with --no-push, review the data, then run `agentstrace confirm`.",
+                "error": "You must run `agentstracer confirm` before pushing.",
+                "hint": "Export first with --no-push, review the data, then run `agentstracer confirm`.",
                 "blocked_on_step": "Step 2/2",
                 "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": "agentstrace confirm",
+                "next_command": "agentstracer confirm",
             }, indent=2))
             sys.exit(1)
         publish_attestation, publish_error = _validate_publish_attestation(args.publish_attestation)
@@ -3564,7 +3564,7 @@ def _run_export(args) -> None:
                 "blocked_on_step": "Step 3/3",
                 "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
                 "next_command": (
-                    "agentstrace export --publish-attestation "
+                    "agentstracer export --publish-attestation "
                     "\"User explicitly approved publishing to Hugging Face on YYYY-MM-DD.\""
                 ),
             }, indent=2))
@@ -3626,12 +3626,12 @@ def _run_export(args) -> None:
 
     if not args.all_projects and not config.get("projects_confirmed", False):
         excluded = set(config.get("excluded_projects", []))
-        list_command = f"agentstrace list --source {source_choice}"
+        list_command = f"agentstracer list --source {source_choice}"
         print(json.dumps({
             "error": "Project selection is not confirmed yet.",
             "hint": (
                 f"Run `{list_command}`, present the full project list to the user, discuss which projects to exclude, then run "
-                "`agentstrace config --exclude \"p1,p2\"` or `agentstrace config --confirm-projects`."
+                "`agentstracer config --exclude \"p1,p2\"` or `agentstracer config --confirm-projects`."
             ),
             "required_action": (
                 "Send the full project/folder list below to the user in a message and get explicit "
@@ -3649,7 +3649,7 @@ def _run_export(args) -> None:
             ],
             "blocked_on_step": "Step 3/5",
             "process_steps": SETUP_TO_PUBLISH_STEPS,
-            "next_command": "agentstrace config --confirm-projects",
+            "next_command": "agentstracer config --confirm-projects",
         }, indent=2))
         sys.exit(1)
 
@@ -3687,7 +3687,7 @@ def _run_export(args) -> None:
         print(f"  - {p['display_name']} (excluded)")
 
     if not included:
-        print("\nNo projects to export. Run: agentstrace config --exclude ''")
+        print("\nNo projects to export. Run: agentstracer config --exclude ''")
         sys.exit(1)
 
     # Build anonymizer with extra usernames from config
@@ -3703,7 +3703,7 @@ def _run_export(args) -> None:
         print(f"Redacting custom strings: {len(custom_strings)} configured")
 
     # Export
-    output_path = args.output or Path("agentstrace_conversations.jsonl")
+    output_path = args.output or Path("agentstracer_conversations.jsonl")
     
     # Check if secrets redaction is disabled (private use)
     no_secrets_redaction = config.get("no_secrets_redaction", False)
@@ -3781,8 +3781,8 @@ def _run_export(args) -> None:
 
     if not repo_id:
         print(f"\nNo HF repo. Log in first: huggingface-cli login")
-        print(f"Then re-run agentstrace and it will auto-detect your username.")
-        print(f"Or set manually: agentstrace config --repo username/my-personal-codex-data")
+        print(f"Then re-run agentstracer and it will auto-detect your username.")
+        print(f"Or set manually: agentstracer config --repo username/my-personal-codex-data")
         print(f"\nLocal file: {output_path}")
         return
 
@@ -3797,8 +3797,8 @@ def _run_export(args) -> None:
         "total_stages": 4,
         "dataset_url": f"https://huggingface.co/datasets/{repo_id}",
         "next_steps": [
-            "Done! Dataset is live. To update later: agentstrace export",
-            "To reconfigure: agentstrace prep then agentstrace config",
+            "Done! Dataset is live. To update later: agentstracer export",
+            "To reconfigure: agentstracer prep then agentstracer config",
         ],
         "next_command": None,
     }
@@ -3835,12 +3835,12 @@ def _print_pii_guidance(output_path: Path) -> None:
     print()
     print("NEXT: Ask for full name to run an exact-name privacy check, then scan for it:")
     print(f"  grep -i 'THEIR_NAME' {abs_output} | head -10")
-    print("  If user declines sharing full name: use agentstrace confirm --skip-full-name-scan with a skip attestation.")
+    print("  If user declines sharing full name: use agentstracer confirm --skip-full-name-scan with a skip attestation.")
     print()
     print("To add custom redactions, then re-export:")
-    print("  agentstrace config --redact-usernames 'github_handle,discord_name'")
-    print("  agentstrace config --redact 'secret-domain.com,my-api-key'")
-    print(f"  agentstrace export --no-push -o {abs_output}")
+    print("  agentstracer config --redact-usernames 'github_handle,discord_name'")
+    print("  agentstracer config --redact 'secret-domain.com,my-api-key'")
+    print(f"  agentstracer export --no-push -o {abs_output}")
     print()
     print(f"Found an issue? Help improve AgentsTrace: {REPO_URL}/issues")
 

@@ -1,8 +1,8 @@
-"""Tests for agentstrace.backends — shared backend detection and resolution."""
+"""Tests for agentstracer.backends — shared backend detection and resolution."""
 
 import pytest
 
-from agentstrace.backends import (
+from agentstracer.backends import (
     BACKEND_CHOICES,
     SUPPORTED_BACKENDS,
     _classify_process_command,
@@ -109,18 +109,18 @@ class TestCheckBackendRuntime:
 
 class TestRequireBackendCommand:
     def test_found(self, monkeypatch):
-        monkeypatch.setattr("agentstrace.backends.shutil.which", lambda cmd: "/usr/bin/" + cmd)
+        monkeypatch.setattr("agentstracer.backends.shutil.which", lambda cmd: "/usr/bin/" + cmd)
         assert require_backend_command("claude") == "claude"
 
     def test_missing_raises(self, monkeypatch):
-        monkeypatch.setattr("agentstrace.backends.shutil.which", lambda cmd: None)
+        monkeypatch.setattr("agentstracer.backends.shutil.which", lambda cmd: None)
         with pytest.raises(RuntimeError, match="CLI not found"):
             require_backend_command("codex")
 
 
 class TestResolveBackendAutoNoAgent:
     def test_raises_when_no_agent(self, monkeypatch):
-        monkeypatch.setattr("agentstrace.backends._detect_current_agent_from_process_tree", lambda **kw: None)
+        monkeypatch.setattr("agentstracer.backends._detect_current_agent_from_process_tree", lambda **kw: None)
         with pytest.raises(RuntimeError, match="Could not detect the current agent"):
             resolve_backend("auto", {})
 
@@ -136,7 +136,7 @@ class TestProcessTreeDetection:
                 return "100"
             return ""
 
-        monkeypatch.setattr("agentstrace.backends._get_process_field", fake_get_field)
+        monkeypatch.setattr("agentstracer.backends._get_process_field", fake_get_field)
         assert _detect_current_agent_from_process_tree(pid=200, max_depth=6) == "claude"
 
     def test_returns_none_at_max_depth(self, monkeypatch):
@@ -145,7 +145,7 @@ class TestProcessTreeDetection:
                 return str(pid + 1)
             return "bash"
 
-        monkeypatch.setattr("agentstrace.backends._get_process_field", fake_get_field)
+        monkeypatch.setattr("agentstracer.backends._get_process_field", fake_get_field)
         assert _detect_current_agent_from_process_tree(pid=10, max_depth=2) is None
 
     def test_handles_cycle(self, monkeypatch):
@@ -154,7 +154,7 @@ class TestProcessTreeDetection:
                 return "10"
             return "bash"
 
-        monkeypatch.setattr("agentstrace.backends._get_process_field", fake_get_field)
+        monkeypatch.setattr("agentstracer.backends._get_process_field", fake_get_field)
         assert _detect_current_agent_from_process_tree(pid=10, max_depth=10) is None
 
 
@@ -163,13 +163,13 @@ class TestGetProcessField:
         import subprocess
         def fake_run(*a, **kw):
             raise subprocess.TimeoutExpired(cmd="ps", timeout=2)
-        monkeypatch.setattr("agentstrace.backends.subprocess.run", fake_run)
+        monkeypatch.setattr("agentstracer.backends.subprocess.run", fake_run)
         assert _get_process_field(1234, "comm") == ""
 
     def test_nonzero_returncode_returns_empty(self, monkeypatch):
         import subprocess
         monkeypatch.setattr(
-            "agentstrace.backends.subprocess.run",
+            "agentstracer.backends.subprocess.run",
             lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),
         )
         assert _get_process_field(99999, "comm") == ""

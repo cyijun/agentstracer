@@ -15,8 +15,8 @@ pip install agentstracer
 或从源码安装：
 
 ```bash
-git clone https://github.com/cyijun/agentstrace.git
-cd agentstrace
+git clone https://github.com/cyijun/agentstracer.git
+cd agentstracer
 pip install -e .
 ```
 
@@ -24,20 +24,20 @@ pip install -e .
 
 ```bash
 # 1. 配置导出源（claude/kimi/codex/gemini/all）
-agentstrace config --source all
+agentstracer config --source all
 
 # 2. 导出对话记录
-agentstrace export --no-push -o my_conversations.jsonl
+agentstracer export --no-push -o my_conversations.jsonl
 ```
 
 ### 私人使用（保留 API Keys）
 
 ```bash
 # 禁用 secrets 脱敏（仅建议本地私人使用）
-agentstrace config --no-secrets-redaction
+agentstracer config --no-secrets-redaction
 
 # 导出（包含原始 API keys）
-agentstrace export --no-push -o my_data.jsonl
+agentstracer export --no-push -o my_data.jsonl
 
 # ⚠️ 警告：此文件包含明文 API keys，请勿分享！
 ```
@@ -46,13 +46,13 @@ agentstrace export --no-push -o my_data.jsonl
 
 ```bash
 # 列出发现的项目
-agentstrace list
+agentstracer list
 
 # 启动本地 Web UI
-agentstrace serve
+agentstracer serve
 
 # 查看配置
-agentstrace config
+agentstracer config
 ```
 
 ---

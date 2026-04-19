@@ -197,7 +197,7 @@ def _flatten_transcript(session: dict[str, Any]) -> str:
                     output = block.get("output")
                     if isinstance(output, str):
                         parts.append(output)
-        # Handle agentstrace's parsed format: tool uses stored as dicts with "tool" key
+        # Handle agentstracer's parsed format: tool uses stored as dicts with "tool" key
         tool = msg.get("tool")
         if tool:
             inp = msg.get("input")
@@ -219,7 +219,7 @@ def _extract_files_touched(session: dict[str, Any]) -> list[str]:
         blocks = []
         if isinstance(content, list):
             blocks = content
-        # Also handle agentstrace parsed format
+        # Also handle agentstracer parsed format
         if msg.get("tool"):
             blocks = [msg]
 

@@ -1,6 +1,6 @@
 """Tests for badge computation."""
 
-from agentstrace.badges import (
+from agentstracer.badges import (
     compute_all_badges,
     compute_display_title,
     compute_outcome_badge,

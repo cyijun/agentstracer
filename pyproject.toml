@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentstracer"
-version = "1.0.0"
+version = "1.0.1"
 description = "Review, score, and curate your coding agent conversation traces locally"
 requires-python = ">=3.10"
 license = "MIT"
@@ -26,17 +26,17 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-agentstrace = "agentstrace.cli:main"
+agentstracer = "agentstracer.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agentstrace*"]
+include = ["agentstracer*"]
 
 [tool.setuptools.package-data]
-"agentstrace" = ["web/frontend/dist/**/*"]
+"agentstracer" = ["web/frontend/dist/**/*"]
 
 [project.urls]
-Homepage = "https://github.com/cyijun/agentstrace"
-Repository = "https://github.com/cyijun/agentstrace"
+Homepage = "https://github.com/cyijun/agentstracer"
+Repository = "https://github.com/cyijun/agentstracer"
 
 [project.optional-dependencies]
 dev = ["pytest"]

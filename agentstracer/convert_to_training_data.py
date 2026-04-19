@@ -1,4 +1,4 @@
-"""Convert agentstrace session exports to provider-agnostic training format.
+"""Convert agentstracer session exports to provider-agnostic training format.
 
 Handles:
 - User message envelope stripping (Sender metadata, System async echoes, timestamps)
@@ -272,7 +272,7 @@ def _extract_session_stats(session: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def convert_session(session: dict) -> list[dict]:
-    """Convert one agentstrace session into a list of training turns."""
+    """Convert one agentstracer session into a list of training turns."""
     msgs = session.get("messages", [])
     turns = group_turns(msgs)
     result = []

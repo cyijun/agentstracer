@@ -1,7 +1,7 @@
 """Shared backend detection and resolution for coding-agent CLIs.
 
 Used by both the scoring pipeline and PII review to auto-detect whether
-agentstrace is running under Claude Code, Codex, or OpenClaw and dispatch
+agentstracer is running under Claude Code, Codex, or OpenClaw and dispatch
 to the corresponding automation CLI.
 """
 
@@ -125,7 +125,7 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
 
     raise RuntimeError(
         "Could not detect the current agent. "
-        "Run agentstrace from a supported agent CLI, set AGENTSTRACE_SCORER_BACKEND, "
+        "Run agentstracer from a supported agent CLI, set AGENTSTRACE_SCORER_BACKEND, "
         "or pass --backend explicitly."
     )
 
@@ -189,7 +189,7 @@ def format_codex_runtime_error(returncode: int, stderr: str, stdout: str = "") -
         return (
             "Codex runs through `codex exec` in non-interactive mode. "
             "This process could not reach the Codex backend from the current environment. "
-            "If you launched agentstrace inside a network-disabled Codex sandbox, "
+            "If you launched agentstracer inside a network-disabled Codex sandbox, "
             "rerun it from your host shell or with network access."
         )
 
@@ -202,7 +202,7 @@ def format_codex_runtime_error(returncode: int, stderr: str, stdout: str = "") -
         return (
             "Codex runs through `codex exec` in non-interactive mode. "
             "`codex exec` reuses saved CLI authentication by default; for automation, "
-            "run `codex login` or set `CODEX_API_KEY` before running agentstrace."
+            "run `codex login` or set `CODEX_API_KEY` before running agentstracer."
         )
 
     summary = summarize_process_error(stderr, stdout)

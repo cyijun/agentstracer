@@ -1,8 +1,8 @@
-"""Tests for agentstrace.card — share card generation."""
+"""Tests for agentstracer.card — share card generation."""
 
 import pytest
 
-from agentstrace.card import (
+from agentstracer.card import (
     MAX_CARD_CHARS,
     _build_card_text,
     _format_duration,

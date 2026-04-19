@@ -1,8 +1,8 @@
-"""Tests for agentstrace.secrets — secret detection and redaction."""
+"""Tests for agentstracer.secrets — secret detection and redaction."""
 
 import pytest
 
-from agentstrace.secrets import (
+from agentstracer.secrets import (
     CONFIDENCE,
     REDACTED,
     SECRET_PATTERNS,
