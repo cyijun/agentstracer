@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +17,6 @@ from .pii import apply_findings_to_session, load_findings, load_jsonl_sessions, 
 from .scoring import SCORING_BACKEND_CHOICES
 from .secrets import _has_mixed_char_types, _shannon_entropy, redact_session
 
-# HF DISABLED — retained for future re-enable
-HF_TAG = "agentstracer"
 REPO_URL = "https://github.com/cyijun/agentstracer"
 # NOTE: SKILL download disabled - local-only mode
 # SKILL_URL = "https://raw.githubusercontent.com/kaiaiagent/clawtrace/main/skills/agentstracer/SKILL.md"
@@ -47,7 +46,7 @@ CONFIRM_COMMAND_SKIP_FULL_NAME_EXAMPLE = (
 )
 
 EXPORT_REVIEW_PUBLISH_STEPS = [
-    "Step 1/2: Export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+    "Step 1/2: Export locally: agentstracer export --output /tmp/agentstracer_export.jsonl",
     "Step 2/2: Review/redact, then confirm: agentstracer confirm ...",
 ]
 
@@ -55,7 +54,7 @@ SETUP_TO_PUBLISH_STEPS = [
     "Step 1/5: Run prep/list to review project scope: agentstracer prep && agentstracer list",
     "Step 2/5: Explicitly choose source scope: agentstracer config --source <claude|codex|gemini|all>",
     "Step 3/5: Configure exclusions/redactions and confirm projects: agentstracer config ...",
-    "Step 4/5: Export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+    "Step 4/5: Export locally: agentstracer export --output /tmp/agentstracer_export.jsonl",
     "Step 5/5: Review and confirm: agentstracer confirm ...",
 ]
 
@@ -171,42 +170,21 @@ def _format_token_count(count: int) -> str:
     return str(count)
 
 
-# HF DISABLED — retained for future re-enable
-def get_hf_username() -> str | None:
-    """Get the currently logged-in HF username, or None."""
-    try:
-        from huggingface_hub import HfApi
-        return HfApi().whoami()["name"]
-    except ImportError:
-        return None
-    except (OSError, KeyError, ValueError):
-        return None
-
-
-# HF DISABLED — retained for future re-enable
-def default_repo_name(hf_username: str) -> str:
-    """Standard repo name: {username}/my-personal-codex-data"""
-    return f"{hf_username}/my-personal-codex-data"
-
-
-def _compute_stage(config: AgentsTraceConfig) -> tuple[str, int, str | None]:
-    """Return (stage_name, stage_number, hf_username).
-
-    HF auth is no longer required. hf_username is always None.
-    """
+def _compute_stage(config: AgentsTraceConfig) -> tuple[str, int]:
+    """Return (stage_name, stage_number)."""
     saved = config.get("stage")
     last_export = config.get("last_export")
     if saved == "done" and last_export:
-        return ("done", 4, None)
+        return ("done", 4)
     if saved == "confirmed" and last_export:
-        return ("confirmed", 3, None)
+        return ("confirmed", 3)
     if saved == "review" and last_export:
-        return ("review", 3, None)
-    return ("configure", 2, None)
+        return ("review", 3)
+    return ("configure", 2)
 
 
 def _build_status_next_steps(
-    stage: str, config: AgentsTraceConfig, hf_user: str | None, repo_id: str | None,
+    stage: str, config: AgentsTraceConfig,
 ) -> tuple[list[str], str | None]:
     """Return (next_steps, next_command) for the given stage."""
     if stage == "configure":
@@ -241,7 +219,7 @@ def _build_status_next_steps(
         steps.extend([
             "Ask about GitHub/Discord usernames to anonymize and sensitive strings to redact. "
             "Configure: agentstracer config --redact-usernames \"handle1\" and agentstracer config --redact \"string1\"",
-            "When done configuring, export locally: agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+            "When done configuring, export locally: agentstracer export --output /tmp/agentstracer_export.jsonl",
         ])
         # next_command is null because user input is needed before exporting
         return (steps, None)
@@ -253,7 +231,7 @@ def _build_status_next_steps(
                 "Run PII scan commands and review results with the user.",
                 "Ask the user: 'Are there any company names, internal project names, client names, private URLs, or other people's names in your conversations that you'd want redacted? Any custom domains or internal tools?' Add anything they mention with agentstracer config --redact.",
                 "Do a deep manual scan: sample ~20 sessions from the export (beginning, middle, end) and scan for names, private URLs, company names, credentials in conversation text, and anything else that looks sensitive. Report findings to the user.",
-                "If PII found in any of the above, add redactions (agentstracer config --redact) and re-export: agentstracer export --no-push",
+                "If PII found in any of the above, add redactions (agentstracer config --redact) and re-export: agentstracer export",
                 (
                     "Run: "
                     + CONFIRM_COMMAND_EXAMPLE
@@ -267,7 +245,7 @@ def _build_status_next_steps(
         return (
             [
                 "Review is complete. Export data is available locally.",
-                "To re-export with updated settings: agentstracer export --no-push",
+                "To re-export with updated settings: agentstracer export",
             ],
             None,
         )
@@ -308,7 +286,6 @@ def _merge_config_list(config: AgentsTraceConfig, key: str, new_values: list[str
 
 
 def configure(
-    repo: str | None = None,
     source: str | None = None,
     exclude: list[str] | None = None,
     redact: list[str] | None = None,
@@ -318,8 +295,6 @@ def configure(
 ):
     """Set config values non-interactively. Lists are MERGED (append), not replaced."""
     config = load_config()
-    if repo is not None:
-        config["repo"] = repo
     if source is not None:
         config["source"] = source
     if exclude is not None:
@@ -491,178 +466,6 @@ def export_to_jsonl(
     }
 
 
-# HF DISABLED — retained for future re-enable
-def push_to_huggingface(jsonl_path: Path, repo_id: str, meta: dict) -> None:
-    """Push JSONL + metadata to HF dataset repo."""
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        print("Error: huggingface_hub not installed. Run: pip install huggingface_hub", file=sys.stderr)
-        sys.exit(1)
-
-    api = HfApi()
-
-    try:
-        user_info = api.whoami()
-        print(f"Logged in as: {user_info['name']}")
-    except (OSError, KeyError, ValueError) as e:
-        print(f"Error: Not logged in to Hugging Face ({e}).", file=sys.stderr)
-        print("Run: huggingface-cli login", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Pushing to: {repo_id}")
-    try:
-        api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
-
-        api.upload_file(
-            path_or_fileobj=str(jsonl_path),
-            path_in_repo="conversations.jsonl",
-            repo_id=repo_id, repo_type="dataset",
-            commit_message="Update conversation data",
-        )
-
-        api.upload_file(
-            path_or_fileobj=json.dumps(meta, indent=2).encode(),
-            path_in_repo="metadata.json",
-            repo_id=repo_id, repo_type="dataset",
-            commit_message="Update metadata",
-        )
-
-        api.upload_file(
-            path_or_fileobj=_build_dataset_card(repo_id, meta).encode(),
-            path_in_repo="README.md",
-            repo_id=repo_id, repo_type="dataset",
-            commit_message="Update dataset card",
-        )
-    except (OSError, ValueError) as e:
-        print(f"Error uploading to Hugging Face: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"\nDataset: https://huggingface.co/datasets/{repo_id}")
-    print(f"Browse all: https://huggingface.co/datasets?other={HF_TAG}")
-
-
-# HF DISABLED — retained for future re-enable
-def _build_dataset_card(repo_id: str, meta: dict) -> str:
-    models = meta.get("models", {})
-    sessions = meta.get("sessions", 0)
-    projects = meta.get("projects", [])
-    total_input = meta.get("total_input_tokens", 0)
-    total_output = meta.get("total_output_tokens", 0)
-    timestamp = meta.get("exported_at", "")[:10]
-
-    model_tags = "\n".join(f"  - {m}" for m in sorted(models.keys()) if m != "unknown")
-    model_lines = "\n".join(
-        f"| {m} | {c} |" for m, c in sorted(models.items(), key=lambda x: -x[1])
-    )
-
-    return f"""---
-license: mit
-task_categories:
-  - text-generation
-language:
-  - en
-tags:
-  - agentstracer
-  - claude-code
-  - codex-cli
-  - gemini-cli
-  - opencode
-  - openclaw
-  - conversations
-  - coding-assistant
-  - tool-use
-  - agentic-coding
-{model_tags}
-pretty_name: Coding Agent Conversations
-configs:
-  - config_name: default
-    data_files: conversations.jsonl
----
-
-# Coding Agent Conversation Logs
-
-> **This is a performance art project.** Anthropic built their models on the world's freely shared information, then introduced increasingly [dystopian data policies](https://www.anthropic.com/news/detecting-and-preventing-distillation-attacks) to stop anyone else from doing the same with their data — pulling up the ladder behind them. AgentsTrace lets you throw the ladder back down. The dataset it produces is yours to share.
-
-Exported with [AgentsTrace]({REPO_URL}).
-
-**Tag: `agentstracer`** — [Browse all AgentsTrace datasets](https://huggingface.co/datasets?other=agentstracer)
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Sessions | {sessions} |
-| Projects | {len(projects)} |
-| Input tokens | {_format_token_count(total_input)} |
-| Output tokens | {_format_token_count(total_output)} |
-| Last updated | {timestamp} |
-
-### Models
-
-| Model | Sessions |
-|-------|----------|
-{model_lines}
-
-## Schema
-
-Each line in `conversations.jsonl` is one conversation session:
-
-```json
-{{
-  "session_id": "uuid",
-  "project": "my-project",
-  "model": "gpt-5.3-codex",
-  "git_branch": "main",
-  "start_time": "2025-01-15T10:00:00+00:00",
-  "end_time": "2025-01-15T10:30:00+00:00",
-  "messages": [
-    {{"role": "user", "content": "Fix the login bug", "timestamp": "..."}},
-    {{
-      "role": "assistant",
-      "content": "I'll investigate the login flow.",
-      "thinking": "The user wants me to...",
-      "tool_uses": [
-          {{
-            "tool": "bash",
-            "input": {{"command": "grep -r 'login' src/"}},
-            "output": {{"text": "src/auth.py:42: def login(user, password):"}},
-            "status": "success"
-          }}
-        ],
-      "timestamp": "..."
-    }}
-  ],
-  "stats": {{
-    "user_messages": 5,
-    "assistant_messages": 8,
-    "tool_uses": 20,
-    "input_tokens": 50000,
-    "output_tokens": 3000
-  }}
-}}
-```
-
-### Privacy
-
-- Paths anonymized to project-relative; usernames hashed
-
-## Load
-
-```python
-from datasets import load_dataset
-ds = load_dataset("{repo_id}", split="train")
-```
-
-## Export your own
-
-```bash
-pip install agentstracer
-agentstracer
-```
-"""
-
-
 SKILL_TARGETS: dict[str, dict[str, str]] = {
     "claude": {
         "dest_template": ".claude/skills/agentstracer/SKILL.md",
@@ -720,17 +523,14 @@ def update_skill(target: str) -> None:
 def status() -> None:
     """Show current stage and next steps (JSON). Read-only — does not modify config."""
     config = load_config()
-    stage, stage_number, _ = _compute_stage(config)
+    stage, stage_number = _compute_stage(config)
 
-    repo_id = config.get("repo")
-
-    next_steps, next_command = _build_status_next_steps(stage, config, None, repo_id)
+    next_steps, next_command = _build_status_next_steps(stage, config)
 
     result = {
         "stage": stage,
         "stage_number": stage_number,
         "total_stages": 4,
-        "repo": repo_id,
         "source": config.get("source"),
         "projects_confirmed": config.get("projects_confirmed", False),
         "last_export": config.get("last_export"),
@@ -745,7 +545,8 @@ def _find_export_file(file_path: Path | None) -> Path:
     if file_path and file_path.exists():
         return file_path
     if file_path is None:
-        for c in [Path("/tmp/agentstracer_export.jsonl"), Path("agentstracer_conversations.jsonl")]:
+        _default_export_name = f"{socket.gethostname()}.jsonl"
+        for c in [Path("/tmp/agentstracer_export.jsonl"), Path("agentstracer_conversations.jsonl"), Path(_default_export_name)]:
             if c.exists():
                 return c
     print(json.dumps({
@@ -753,7 +554,7 @@ def _find_export_file(file_path: Path | None) -> Path:
         "hint": "Run step 1 first to generate a local export file.",
         "blocked_on_step": "Step 1/2",
         "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-        "next_command": "agentstracer export --no-push --output /tmp/agentstracer_export.jsonl",
+        "next_command": "agentstracer export --output /tmp/agentstracer_export.jsonl",
     }, indent=2))
     sys.exit(1)
 
@@ -1030,19 +831,6 @@ def _collect_review_attestations(
     return provided, errors, manual_sessions
 
 
-# HF DISABLED — retained for future re-enable
-def _validate_publish_attestation(attestation: object) -> tuple[str, str | None]:
-    normalized = _normalize_attestation_text(attestation)
-    if len(normalized) < MIN_ATTESTATION_CHARS:
-        return normalized, "Provide a detailed text publish attestation."
-    lower = normalized.lower()
-    if "approv" not in lower or ("publish" not in lower and "push" not in lower):
-        return normalized, (
-            "Publish attestation must state that the user explicitly approved publishing/pushing."
-        )
-    return normalized, None
-
-
 def confirm(
     file_path: Path | None = None,
     full_name: str | None = None,
@@ -1133,7 +921,6 @@ def confirm(
         sys.exit(1)
 
     file_size = file_path.stat().st_size
-    repo_id = config.get("repo")
 
     # Run PII scans
     pii_findings = _scan_pii(file_path)
@@ -1167,12 +954,12 @@ def confirm(
         )
     elif full_name_scan.get("match_count", 0):
         next_steps.append(
-            "Full-name scan found matches. Review them with the user and redact if needed, then re-export with --no-push."
+            "Full-name scan found matches. Review them with the user and redact if needed, then re-export."
         )
     if pii_findings:
         next_steps.append(
             "PII findings detected — review each one with the user. "
-            "If real: agentstracer config --redact \"string\" then re-export with --no-push. "
+            "If real: agentstracer config --redact \"string\" then re-export. "
             "False positives can be ignored."
         )
     if "high_entropy_strings" in pii_findings:
@@ -1180,10 +967,10 @@ def confirm(
             "High-entropy strings detected — these may be leaked secrets (API keys, tokens, "
             "passwords) that escaped automatic redaction. Review each one using the provided "
             "context snippets. If any are real secrets, redact with: "
-            "agentstracer config --redact \"the_secret\" then re-export with --no-push."
+            "agentstracer config --redact \"the_secret\" then re-export."
         )
     next_steps.extend([
-        "If any project should be excluded, run: agentstracer config --exclude \"project_name\" and re-export with --no-push.",
+        "If any project should be excluded, run: agentstracer config --exclude \"project_name\" and re-export.",
         f"Review is complete. {total} sessions ({_format_size(file_size)}) exported locally.",
     ])
 
@@ -1202,7 +989,6 @@ def confirm(
         "pii_scan": pii_findings if pii_findings else "clean",
         "full_name_scan": full_name_scan,
         "manual_scan_sessions": manual_scan_sessions,
-        "repo": repo_id,
         "last_export_timestamp": last_export.get("timestamp"),
         "next_steps": next_steps,
         "next_command": None,
@@ -1242,15 +1028,13 @@ def prep(source_filter: str = "auto") -> None:
     excluded = set(config.get("excluded_projects", []))
 
     # Use _compute_stage to determine where we are
-    stage, stage_number, _ = _compute_stage(config)
-
-    repo_id = config.get("repo")
+    stage, stage_number = _compute_stage(config)
 
     # Build contextual next_steps
     stage_config = cast(AgentsTraceConfig, dict(config))
     if source_explicit:
         stage_config["source"] = resolved_source_choice
-    next_steps, next_command = _build_status_next_steps(stage, stage_config, None, repo_id)
+    next_steps, next_command = _build_status_next_steps(stage, stage_config)
 
     # Persist stage
     config["stage"] = stage
@@ -1264,7 +1048,6 @@ def prep(source_filter: str = "auto") -> None:
         "requested_source_filter": source_filter,
         "source_filter": resolved_source_choice,
         "source_selection_confirmed": source_explicit,
-        "repo": repo_id,
         "projects": [
             {
                 "name": p["display_name"],
@@ -2915,12 +2698,8 @@ def main() -> None:
                     help="Text attestation describing how full-name scan was done.")
     cf.add_argument("--attest-sensitive", type=str, default=None,
                     help="Text attestation describing sensitive-entity review and outcome.")
-    cf.add_argument("--attest-manual-scan", type=str, nargs="?", const="__DEPRECATED_FLAG__", default=None,
+    cf.add_argument("--attest-manual-scan", type=str, default=None,
                     help=f"Text attestation describing manual scan ({MIN_MANUAL_SCAN_SESSIONS}+ sessions).")
-    # Deprecated boolean attestations retained only for a guided migration error.
-    cf.add_argument("--attest-asked-full-name", action="store_true", help=argparse.SUPPRESS)
-    cf.add_argument("--attest-asked-sensitive", action="store_true", help=argparse.SUPPRESS)
-    cf.add_argument("--attest-asked-manual-scan", action="store_true", help=argparse.SUPPRESS)
     list_parser = sub.add_parser("list", help="List all projects")
     list_parser.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
 
@@ -2929,7 +2708,6 @@ def main() -> None:
                     help="Agent to install skill for")
 
     cfg = sub.add_parser("config", help="View or set config")
-    cfg.add_argument("--repo", type=str, help="Set HF repo")
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
                      help="Set export source scope explicitly: claude, codex, gemini, or all")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
@@ -3109,7 +2887,6 @@ def main() -> None:
     # Export flags on both the subcommand and root parser so `agentstracer --push` works
     for target in (exp, parser):
         target.add_argument("--output", "-o", type=Path, default=None)
-        target.add_argument("--repo", "-r", type=str, default=None)
         target.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
         target.add_argument("--all-projects", action="store_true")
         target.add_argument("--no-thinking", action="store_true")
@@ -3125,17 +2902,6 @@ def main() -> None:
                             help="Custom output path for sanitized JSONL when --pii-apply is enabled")
         target.add_argument("--pii-backend", choices=list(BACKEND_CHOICES), default="auto",
                             help="Agent backend for AI-based PII review (default: auto = current agent's CLI)")
-        target.add_argument("--push", action="store_true",
-                            help="Upload to Hugging Face after export (requires agentstracer confirm first)")
-        target.add_argument("--no-push", action="store_true",
-                            help="(Default, kept for backwards compatibility) Export locally only")
-        target.add_argument(
-            "--publish-attestation",
-            type=str,
-            default=None,
-            help="Required for push: text attestation that user explicitly approved publishing.",
-        )
-        target.add_argument("--attest-user-approved-publish", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     command = args.command or "export"
@@ -3257,22 +3023,6 @@ def main() -> None:
         return
 
     if command == "confirm":
-        if (
-            args.attest_asked_full_name
-            or args.attest_asked_sensitive
-            or args.attest_asked_manual_scan
-            or args.attest_manual_scan == "__DEPRECATED_FLAG__"
-        ):
-            print(json.dumps({
-                "error": "Deprecated boolean attestation flags were provided.",
-                "hint": (
-                    "Use text attestations instead so the command can validate what was reviewed."
-                ),
-                "blocked_on_step": "Step 2/2",
-                "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": CONFIRM_COMMAND_EXAMPLE,
-            }, indent=2))
-            sys.exit(1)
         confirm(
             file_path=args.file,
             full_name=args.full_name,
@@ -3309,8 +3059,7 @@ def _parse_csv_arg(value: str | None) -> list[str] | None:
 def _handle_config(args) -> None:
     """Handle the config subcommand."""
     has_changes = (
-        args.repo
-        or args.source
+        args.source
         or args.exclude
         or args.redact
         or args.redact_usernames
@@ -3321,7 +3070,6 @@ def _handle_config(args) -> None:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
         return
     configure(
-        repo=args.repo,
         source=args.source,
         exclude=_parse_csv_arg(args.exclude),
         redact=_parse_csv_arg(args.redact),
@@ -3524,85 +3272,6 @@ def _run_export(args) -> None:
         }, indent=2))
         sys.exit(1)
 
-    # Gate: require `agentstracer confirm` before pushing
-    # Default is local-only. Push only when --push is explicitly passed.
-    wants_push = getattr(args, "push", False) and not args.no_push
-    if wants_push:
-        print(json.dumps({
-            "error": "Uploading to Hugging Face is temporarily disabled.",
-            "hint": "Use 'agentstracer export' to export locally.",
-        }, indent=2))
-        sys.exit(1)
-    if False:  # HF upload disabled — preserved for future re-enable
-        if args.attest_user_approved_publish and not args.publish_attestation:
-            print(json.dumps({
-                "error": "Deprecated publish attestation flag was provided.",
-                "hint": "Use --publish-attestation with a detailed text statement.",
-                "blocked_on_step": "Step 3/3",
-                "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": (
-                    "agentstracer export --publish-attestation "
-                    "\"User explicitly approved publishing to Hugging Face on YYYY-MM-DD.\""
-                ),
-            }, indent=2))
-            sys.exit(1)
-        if config.get("stage") != "confirmed":
-            print(json.dumps({
-                "error": "You must run `agentstracer confirm` before pushing.",
-                "hint": "Export first with --no-push, review the data, then run `agentstracer confirm`.",
-                "blocked_on_step": "Step 2/2",
-                "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": "agentstracer confirm",
-            }, indent=2))
-            sys.exit(1)
-        publish_attestation, publish_error = _validate_publish_attestation(args.publish_attestation)
-        if publish_error:
-            print(json.dumps({
-                "error": "Missing or invalid publish attestation.",
-                "publish_attestation_error": publish_error,
-                "hint": "Ask the user to explicitly approve publishing, then pass a detailed text attestation.",
-                "blocked_on_step": "Step 3/3",
-                "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": (
-                    "agentstracer export --publish-attestation "
-                    "\"User explicitly approved publishing to Hugging Face on YYYY-MM-DD.\""
-                ),
-            }, indent=2))
-            sys.exit(1)
-
-        review_attestations = config.get("review_attestations", {})
-        review_verification = config.get("review_verification", {})
-        verified_full_name = _normalize_attestation_text(review_verification.get("full_name"))
-        _, review_errors, _ = _collect_review_attestations(
-            attest_asked_full_name=review_attestations.get("asked_full_name"),
-            attest_asked_sensitive=review_attestations.get("asked_sensitive_entities"),
-            attest_manual_scan=review_attestations.get("manual_scan_done"),
-            full_name=verified_full_name if verified_full_name else None,
-            skip_full_name_scan=bool(review_verification.get("full_name_scan_skipped", False)),
-        )
-        if not verified_full_name and not review_verification.get("full_name_scan_skipped", False):
-            review_errors["asked_full_name"] = (
-                "Missing verified full-name scan from confirm step; rerun confirm (or use --skip-full-name-scan if the user declined)."
-            )
-        verified_manual_count = review_verification.get("manual_scan_sessions")
-        if not isinstance(verified_manual_count, int) or verified_manual_count < MIN_MANUAL_SCAN_SESSIONS:
-            review_errors["manual_scan_done"] = (
-                "Missing verified manual scan evidence from confirm step; rerun confirm."
-            )
-
-        if review_errors:
-            print(json.dumps({
-                "error": "Missing or invalid review attestations from confirm step.",
-                "attestation_errors": review_errors,
-                "blocked_on_step": "Step 2/2",
-                "process_steps": EXPORT_REVIEW_PUBLISH_STEPS,
-                "next_command": CONFIRM_COMMAND_EXAMPLE,
-            }, indent=2))
-            sys.exit(1)
-
-        config["publish_attestation"] = publish_attestation
-        save_config(config)
-
     print("=" * 50)
     print("  AgentsTrace — Agent Trace Exporter")
     print("=" * 50)
@@ -3659,16 +3328,6 @@ def _run_export(args) -> None:
           f"({_format_size(total_size)} raw)")
     print(f"Source scope: {source_choice}")
 
-    # Resolve repo — CLI flag > config > auto-detect from HF username
-    repo_id = args.repo or config.get("repo")
-    if not repo_id and wants_push:
-        hf_user = get_hf_username()
-        if hf_user:
-            repo_id = default_repo_name(hf_user)
-            print(f"\nAuto-detected HF repo: {repo_id}")
-            config["repo"] = repo_id
-            save_config(config)
-
     # Apply exclusions
     excluded = set(config.get("excluded_projects", []))
     if args.all_projects:
@@ -3703,7 +3362,8 @@ def _run_export(args) -> None:
         print(f"Redacting custom strings: {len(custom_strings)} configured")
 
     # Export
-    output_path = args.output or Path("agentstracer_conversations.jsonl")
+    _default_export_name = f"{socket.gethostname()}.jsonl"
+    output_path = args.output or Path(_default_export_name)
     
     # Check if secrets redaction is disabled (private use)
     no_secrets_redaction = config.get("no_secrets_redaction", False)
@@ -3754,53 +3414,24 @@ def _run_export(args) -> None:
         "pii_review": pii_review_summary,
         "pii_apply": pii_apply_summary,
     }
-    if not wants_push:
-        config["stage"] = "review"
+    config["stage"] = "review"
     save_config(config)
 
-    if not wants_push:
-        print(f"\nDone! JSONL file: {output_path}")
-        abs_path = str(output_path.resolve())
-        next_steps, next_command = _build_status_next_steps("review", config, None, None)
-        json_block = {
-            "stage": "review",
-            "stage_number": 3,
-            "total_stages": 4,
-            "sessions": meta["sessions"],
-            "source": source_choice,
-            "output_file": abs_path,
-            "pii_commands": _build_pii_commands(output_path),
-            "pii_review": pii_review_summary,
-            "pii_apply": pii_apply_summary,
-            "next_steps": next_steps,
-            "next_command": next_command,
-        }
-        print("\n---AGENTSTRACE_JSON---")
-        print(json.dumps(json_block, indent=2))
-        return
-
-    if not repo_id:
-        print(f"\nNo HF repo. Log in first: huggingface-cli login")
-        print(f"Then re-run agentstracer and it will auto-detect your username.")
-        print(f"Or set manually: agentstracer config --repo username/my-personal-codex-data")
-        print(f"\nLocal file: {output_path}")
-        return
-
-    push_to_huggingface(output_path, repo_id, meta)
-
-    config["stage"] = "done"
-    save_config(config)
-
+    print(f"\nDone! JSONL file: {output_path}")
+    abs_path = str(output_path.resolve())
+    next_steps, next_command = _build_status_next_steps("review", config)
     json_block = {
-        "stage": "done",
-        "stage_number": 4,
+        "stage": "review",
+        "stage_number": 3,
         "total_stages": 4,
-        "dataset_url": f"https://huggingface.co/datasets/{repo_id}",
-        "next_steps": [
-            "Done! Dataset is live. To update later: agentstracer export",
-            "To reconfigure: agentstracer prep then agentstracer config",
-        ],
-        "next_command": None,
+        "sessions": meta["sessions"],
+        "source": source_choice,
+        "output_file": abs_path,
+        "pii_commands": _build_pii_commands(output_path),
+        "pii_review": pii_review_summary,
+        "pii_apply": pii_apply_summary,
+        "next_steps": next_steps,
+        "next_command": next_command,
     }
     print("\n---AGENTSTRACE_JSON---")
     print(json.dumps(json_block, indent=2))
@@ -3840,7 +3471,7 @@ def _print_pii_guidance(output_path: Path) -> None:
     print("To add custom redactions, then re-export:")
     print("  agentstracer config --redact-usernames 'github_handle,discord_name'")
     print("  agentstracer config --redact 'secret-domain.com,my-api-key'")
-    print(f"  agentstracer export --no-push -o {abs_output}")
+    print(f"  agentstracer export -o {abs_output}")
     print()
     print(f"Found an issue? Help improve AgentsTrace: {REPO_URL}/issues")
 

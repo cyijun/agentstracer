@@ -770,7 +770,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
             # Serve the zip
             date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-            filename = f"agentstracer-bundle-{bundle_id[:8]}-{date_str}.zip"
+            import socket
+            hostname = socket.gethostname()
+            filename = f"agentstracer-bundle-{hostname}-{bundle_id[:8]}-{date_str}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')

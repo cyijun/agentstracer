@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentstracer"
-version = "1.0.1"
+version = "1.0.2"
 description = "Review, score, and curate your coding agent conversation traces locally"
 requires-python = ">=3.10"
 license = "MIT"

@@ -9,7 +9,6 @@ import pytest
 
 from agentstracer.cli import (
     _build_status_next_steps,
-    _build_dataset_card,
     _collect_review_attestations,
     _format_size,
     _format_token_count,
@@ -20,9 +19,7 @@ from agentstracer.cli import (
     _scan_pii,
     _share_pii_status,
     _share_preview,
-    _validate_publish_attestation,
     configure,
-    default_repo_name,
     export_to_jsonl,
     list_projects,
     main,
@@ -146,15 +143,6 @@ class TestAttestationHelpers:
         )
         assert "asked_full_name" in errors
 
-    def test_validate_publish_attestation(self):
-        _normalized, err = _validate_publish_attestation(
-            "User explicitly approved publishing this dataset now."
-        )
-        assert err is None
-
-        _normalized, err = _validate_publish_attestation("ok to go")
-        assert err is not None
-
     def test_scan_for_text_occurrences(self, tmp_path):
         f = tmp_path / "sample.jsonl"
         f.write_text('{"message":"Jane Doe says hi"}\n{"message":"nothing here"}\n')
@@ -208,62 +196,6 @@ class TestMergeConfigList:
         config = {}
         _merge_config_list(config, "items", ["a"])
         assert config["items"] == ["a"]
-
-
-# --- default_repo_name ---
-
-
-class TestDefaultRepoName:
-    def test_format(self):
-        result = default_repo_name("alice")
-        assert result == "alice/my-personal-codex-data"
-
-    def test_contains_username(self):
-        result = default_repo_name("bob")
-        assert "bob" in result
-        assert "/" in result
-
-
-# --- _build_dataset_card ---
-
-
-class TestBuildDatasetCard:
-    def test_returns_valid_markdown(self):
-        meta = {
-            "models": {"claude-sonnet-4-20250514": 10},
-            "sessions": 10,
-            "projects": ["proj1"],
-            "total_input_tokens": 50000,
-            "total_output_tokens": 3000,
-            "exported_at": "2025-01-15T10:00:00+00:00",
-        }
-        card = _build_dataset_card("user/repo", meta)
-        assert "---" in card  # YAML frontmatter
-        assert "agentstracer" in card
-        assert "claude-sonnet" in card
-        assert "10" in card
-
-    def test_yaml_frontmatter(self):
-        meta = {
-            "models": {}, "sessions": 0, "projects": [],
-            "total_input_tokens": 0, "total_output_tokens": 0,
-            "exported_at": "",
-        }
-        card = _build_dataset_card("user/repo", meta)
-        lines = card.strip().split("\n")
-        assert lines[0] == "---"
-        # Find second ---
-        second_dash = [i for i, l in enumerate(lines[1:], 1) if l.strip() == "---"]
-        assert len(second_dash) >= 1
-
-    def test_contains_repo_id(self):
-        meta = {
-            "models": {}, "sessions": 0, "projects": [],
-            "total_input_tokens": 0, "total_output_tokens": 0,
-            "exported_at": "",
-        }
-        card = _build_dataset_card("alice/my-dataset", meta)
-        assert "alice/my-dataset" in card
 
 
 # --- export_to_jsonl ---
@@ -350,16 +282,6 @@ class TestExportToJsonl:
 
 
 class TestConfigure:
-    def test_sets_repo(self, tmp_config, monkeypatch, capsys):
-        # Also monkeypatch the cli module's references
-        monkeypatch.setattr("agentstracer.cli.CONFIG_FILE", tmp_config)
-        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"repo": None, "excluded_projects": [], "redact_strings": []})
-        saved = {}
-        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
-
-        configure(repo="alice/my-repo")
-        assert saved["repo"] == "alice/my-repo"
-
     def test_merges_exclude(self, tmp_config, monkeypatch, capsys):
         monkeypatch.setattr("agentstracer.cli.CONFIG_FILE", tmp_config)
         monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"excluded_projects": ["a"], "redact_strings": []})
@@ -371,7 +293,7 @@ class TestConfigure:
 
     def test_sets_source(self, tmp_config, monkeypatch, capsys):
         monkeypatch.setattr("agentstracer.cli.CONFIG_FILE", tmp_config)
-        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"repo": None, "source": None})
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"source": None})
         saved = {}
         monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
 
@@ -465,7 +387,7 @@ class TestWorkflowGateMessages:
         assert payload["error"] == "No export file found."
         assert payload["blocked_on_step"] == "Step 1/2"
         assert len(payload["process_steps"]) == 2
-        assert "export --no-push" in payload["process_steps"][0]
+        assert "export --output" in payload["process_steps"][0]
 
     def test_confirm_missing_full_name_explains_purpose_and_skip(self, tmp_path, monkeypatch, capsys):
         export_file = tmp_path / "export.jsonl"
@@ -519,15 +441,6 @@ class TestWorkflowGateMessages:
         assert payload["stage"] == "confirmed"
         assert payload["full_name_scan"]["skipped"] is True
 
-    def test_push_before_confirm_shows_step_process(self, monkeypatch, capsys):
-        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"stage": "review", "source": "all"})
-        monkeypatch.setattr("sys.argv", ["agentstracer", "export", "--push"])
-        with pytest.raises(SystemExit):
-            main()
-        payload = self._extract_json(capsys.readouterr().out)
-        assert payload["error"] == "Uploading to Hugging Face is temporarily disabled."
-        assert "hint" in payload
-
     def test_export_requires_project_confirmation_with_full_flow(self, monkeypatch, capsys):
         monkeypatch.setattr("agentstracer.cli._has_session_sources", lambda _src: True)
         monkeypatch.setattr(
@@ -542,7 +455,7 @@ class TestWorkflowGateMessages:
             ],
         )
         monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"source": "all"})
-        monkeypatch.setattr("sys.argv", ["agentstracer", "export", "--no-push"])
+        monkeypatch.setattr("sys.argv", ["agentstracer", "export"])
         with pytest.raises(SystemExit):
             main()
         payload = self._extract_json(capsys.readouterr().out)
@@ -558,7 +471,7 @@ class TestWorkflowGateMessages:
 
     def test_export_requires_explicit_source_selection(self, monkeypatch, capsys):
         monkeypatch.setattr("agentstracer.cli.load_config", lambda: {})
-        monkeypatch.setattr("sys.argv", ["agentstracer", "export", "--no-push"])
+        monkeypatch.setattr("sys.argv", ["agentstracer", "export"])
         with pytest.raises(SystemExit):
             main()
         payload = self._extract_json(capsys.readouterr().out)
@@ -572,8 +485,6 @@ class TestWorkflowGateMessages:
         steps, _next = _build_status_next_steps(
             "configure",
             {"projects_confirmed": False},
-            "alice",
-            "alice/my-personal-codex-data",
         )
         assert any("agentstracer list" in step for step in steps)
         assert any("FULL project/folder list" in step for step in steps)
@@ -584,8 +495,6 @@ class TestWorkflowGateMessages:
         steps, _next = _build_status_next_steps(
             "review",
             {},
-            "alice",
-            "alice/my-personal-codex-data",
         )
         assert any("exact-name privacy check" in step for step in steps)
         assert any("--skip-full-name-scan" in step for step in steps)
