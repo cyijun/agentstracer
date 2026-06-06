@@ -278,6 +278,23 @@ def list_projects(source_filter: str = "auto") -> None:
     ))
 
 
+def _compute_total_tokens(source_filter: str = "auto") -> int:
+    """Parse all sessions and return the sum of input_tokens + output_tokens."""
+    projects = _filter_projects_by_source(discover_projects(), source_filter)
+    total = 0
+    anonymizer = Anonymizer()
+    for project in projects:
+        sessions = parse_project_sessions(
+            project["dir_name"], anonymizer=anonymizer,
+            include_thinking=True,
+            source=project.get("source", "unknown"),
+        )
+        for session in sessions:
+            stats = session.get("stats", {})
+            total += stats.get("input_tokens", 0) + stats.get("output_tokens", 0)
+    return total
+
+
 def _merge_config_list(config: AgentsTraceConfig, key: str, new_values: list[str]) -> None:
     """Append new_values to a config list (deduplicated, sorted)."""
     existing = set(config.get(key, []))
@@ -2702,6 +2719,8 @@ def main() -> None:
                     help=f"Text attestation describing manual scan ({MIN_MANUAL_SCAN_SESSIONS}+ sessions).")
     list_parser = sub.add_parser("list", help="List all projects")
     list_parser.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
+    list_parser.add_argument("--tokens", action="store_true",
+                             help="Output total token count across all sessions (integer only)")
 
     us = sub.add_parser("update-skill", help="Install/update the agentstracer skill for a coding agent")
     us.add_argument("target", choices=["claude", "openclaw", "codex", "cline"],
@@ -3040,7 +3059,11 @@ def main() -> None:
     if command == "list":
         config = load_config()
         resolved_source_choice, _ = _resolve_source_choice(args.source, config)
-        list_projects(source_filter=resolved_source_choice)
+        if getattr(args, "tokens", False):
+            total = _compute_total_tokens(source_filter=resolved_source_choice)
+            print(total)
+        else:
+            list_projects(source_filter=resolved_source_choice)
         return
 
     if command == "config":
