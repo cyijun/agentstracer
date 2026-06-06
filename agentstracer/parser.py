@@ -726,6 +726,15 @@ def _parse_claude_session_file(
     except OSError:
         return None
 
+    # Merge subagent entries if present (same-named directory with subagents/)
+    subagent_dir = filepath.parent / filepath.stem / "subagents"
+    if subagent_dir.is_dir():
+        for sa_file in sorted(subagent_dir.glob("agent-*.jsonl")):
+            for entry in _iter_jsonl(sa_file):
+                entries.append(entry)
+        # Sort combined entries by timestamp for chronological processing
+        entries.sort(key=lambda e: e.get("timestamp", ""))
+
     tool_result_map = _build_tool_result_map(entries, anonymizer)
     for entry in entries:
         _process_entry(entry, messages, metadata, stats, anonymizer, include_thinking, tool_result_map)
