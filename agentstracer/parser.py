@@ -1670,6 +1670,50 @@ def _get_opencode_project_index(refresh: bool = False) -> dict[str, list[str]]:
     return _OPENCODE_PROJECT_INDEX
 
 
+def _extract_kimi_text_parts(content: Any, anonymizer: Anonymizer) -> list[str]:
+    """Extract text parts from a Kimi message content list."""
+    parts: list[str] = []
+    if not isinstance(content, list):
+        return parts
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text", "").strip()
+            if text:
+                parts.append(anonymizer.text(text))
+    return parts
+
+
+def _extract_kimi_thinking_parts(content: Any, anonymizer: Anonymizer) -> list[str]:
+    """Extract think parts from a Kimi message content list."""
+    parts: list[str] = []
+    if not isinstance(content, list):
+        return parts
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "think":
+            think = block.get("think", "").strip()
+            if think:
+                parts.append(anonymizer.text(think))
+    return parts
+
+
+def _build_kimi_tool_use(
+    name: str | None,
+    tool_call_id: str | None,
+    arguments: Any,
+    anonymizer: Anonymizer,
+) -> dict[str, Any]:
+    """Build a normalized tool_use dict from a Kimi tool call."""
+    return {
+        "tool": name,
+        "id": tool_call_id,
+        "input": _parse_tool_input(name, arguments, anonymizer),
+    }
+
+
 def _parse_kimi_session_file(
     filepath: Path,
     anonymizer: Anonymizer,
