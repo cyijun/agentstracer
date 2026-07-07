@@ -11,7 +11,7 @@ from typing import Any, Mapping, cast
 
 from .anonymizer import Anonymizer
 from .config import CONFIG_FILE, AgentsTraceConfig, load_config, save_config
-from .parser import CLAUDE_DIR, CODEX_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
+from .parser import CLAUDE_DIR, CODEX_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_SESSIONS_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
 from .backends import BACKEND_CHOICES
 from .pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
 from .scoring import SCORING_BACKEND_CHOICES
@@ -90,10 +90,10 @@ def _source_label(source_filter: str) -> str:
     if source_filter == "openclaw":
         return "OpenClaw"
     if source_filter == "kimi":
-        return "Kimi CLI"
+        return "Kimi Code CLI"
     if source_filter == "custom":
         return "Custom"
-    return "Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
+    return "Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi Code CLI, or Custom"
 
 
 def _normalize_source_filter(source_filter: str) -> str:
@@ -138,10 +138,10 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
     if source_filter == "openclaw":
         return OPENCLAW_DIR.exists()
     if source_filter == "kimi":
-        return KIMI_DIR.exists()
+        return KIMI_SESSIONS_DIR.exists()
     if source_filter == "custom":
         return CUSTOM_DIR.exists()
-    return CLAUDE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists()
+    return CLAUDE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_SESSIONS_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists()
 
 
 def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list[dict]:
