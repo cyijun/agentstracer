@@ -40,9 +40,7 @@ OPENCLAW_DIR = Path.home() / ".openclaw"
 OPENCLAW_AGENTS_DIR = OPENCLAW_DIR / "agents"
 UNKNOWN_OPENCLAW_CWD = "<unknown-cwd>"
 
-KIMI_DIR = Path.home() / ".kimi"
-KIMI_SESSIONS_DIR = KIMI_DIR / "sessions"
-KIMI_CONFIG_PATH = KIMI_DIR / "kimi.json"
+KIMI_SESSIONS_DIR = Path.home() / ".kimi-code" / "sessions"
 UNKNOWN_KIMI_CWD = "<unknown-cwd>"
 
 CUSTOM_DIR = Path.home() / ".agentstracer" / "custom"
@@ -74,7 +72,6 @@ _CODEX_PROJECT_INDEX: dict[str, list[Path]] = {}
 _GEMINI_HASH_MAP: dict[str, str] = {}
 _OPENCODE_PROJECT_INDEX: dict[str, list[str]] = {}
 _OPENCLAW_PROJECT_INDEX: dict[str, list[Path]] = {}
-_KIMI_PROJECT_INDEX: dict[str, list[Path]] = {}
 
 
 def _build_gemini_hash_map() -> dict[str, str]:
