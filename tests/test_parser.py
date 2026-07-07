@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -1843,3 +1844,201 @@ class TestDiscoverCustomProjects:
         monkeypatch.setattr("agentstracer.parser.CUSTOM_DIR", custom_dir)
         sessions = parse_project_sessions("nope", mock_anonymizer, source="custom")
         assert sessions == []
+
+
+# --- Kimi-Code migrated session test ---
+
+
+class TestKimiCodeMigratedSession:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agentstracer.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("agentstracer.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("agentstracer.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("agentstracer.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("agentstracer.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("agentstracer.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("agentstracer.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.CUSTOM_DIR", tmp_path / "no-custom")
+
+    def _make_migrated_session_dir(self, base: Path, project: str, session_id: str):
+        session_dir = base / project / session_id
+        session_dir.mkdir(parents=True)
+        (session_dir / "state.json").write_text(json.dumps({
+            "createdAt": "2026-07-06T00:00:00+00:00",
+            "updatedAt": "2026-07-06T00:01:00+00:00",
+        }))
+        wire_dir = session_dir / "agents" / "main"
+        wire_dir.mkdir(parents=True)
+        wire_lines = [
+            json.dumps({"type": "metadata", "protocol_version": "1.0"}),
+            json.dumps({
+                "type": "context.append_message",
+                "time": 1783000000000,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Hello"}],
+                    "toolCalls": [],
+                },
+            }),
+            json.dumps({
+                "type": "context.append_message",
+                "time": 1783000001000,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "think", "think": "I should greet the user."},
+                        {"type": "text", "text": "Hi there!"},
+                    ],
+                    "toolCalls": [
+                        {
+                            "type": "function",
+                            "id": "tool_1",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"path": "/tmp/file.txt"}),
+                            },
+                        },
+                    ],
+                },
+            }),
+            json.dumps({
+                "type": "context.append_message",
+                "time": 1783000002000,
+                "message": {
+                    "role": "tool",
+                    "toolCallId": "tool_1",
+                    "content": [{"type": "text", "text": "file contents"}],
+                },
+            }),
+        ]
+        (wire_dir / "wire.jsonl").write_text("\n".join(wire_lines) + "\n")
+        return session_dir
+
+    def test_discover_and_parse_migrated_session(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        kimi_dir = tmp_path / "kimi-code-sessions"
+        monkeypatch.setattr("agentstracer.parser.KIMI_SESSIONS_DIR", kimi_dir)
+
+        self._make_migrated_session_dir(kimi_dir, "wd_myapp_a1b2c3d4e5f6", "ses_00000000-0000-0000-0000-000000000001")
+
+        projects = discover_projects()
+        assert len(projects) == 1
+        assert projects[0]["display_name"] == "kimi:myapp"
+        assert projects[0]["session_count"] == 1
+
+        sessions = parse_project_sessions("wd_myapp_a1b2c3d4e5f6", mock_anonymizer, source="kimi")
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session["source"] == "kimi"
+        assert session["project"] == "kimi:myapp"
+        assert len(session["messages"]) == 2
+        assert session["messages"][0]["role"] == "user"
+        assert session["messages"][0]["content"] == "Hello"
+        assert session["messages"][1]["role"] == "assistant"
+        assert session["messages"][1]["content"] == "Hi there!"
+        assert session["messages"][1]["thinking"] == "I should greet the user."
+        assert len(session["messages"][1]["tool_uses"]) == 1
+        tool = session["messages"][1]["tool_uses"][0]
+        assert tool["tool"] == "Read"
+        assert tool["input"] == {"path": "/tmp/file.txt"}
+        assert tool["output"] == "file contents"
+        assert tool["status"] == "success"
+        assert session["stats"]["user_messages"] == 1
+        assert session["stats"]["assistant_messages"] == 1
+        assert session["stats"]["tool_uses"] == 1
+
+
+# --- Kimi-Code native session test ---
+
+
+class TestKimiCodeNativeSession:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agentstracer.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("agentstracer.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("agentstracer.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("agentstracer.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("agentstracer.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("agentstracer.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("agentstracer.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("agentstracer.parser.CUSTOM_DIR", tmp_path / "no-custom")
+
+    def _make_native_session_dir(self, base: Path, project: str, session_id: str):
+        session_dir = base / project / session_id
+        session_dir.mkdir(parents=True)
+        (session_dir / "state.json").write_text(json.dumps({
+            "createdAt": "2026-07-06T00:00:00+00:00",
+            "updatedAt": "2026-07-06T00:01:00+00:00",
+        }))
+        wire_dir = session_dir / "agents" / "main"
+        wire_dir.mkdir(parents=True)
+        wire_lines = [
+            json.dumps({"type": "metadata", "protocol_version": "1.4"}),
+            json.dumps({"type": "config.update", "modelAlias": "kimi-code/kimi-for-coding"}),
+            json.dumps({
+                "type": "context.append_message",
+                "time": 1783000000000,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Run a command"}],
+                    "toolCalls": [],
+                },
+            }),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "step.begin", "step": 1}}),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "content.part", "part": {"type": "think", "think": "I will run ls."}}}),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "tool.call", "toolCallId": "tool_1", "name": "Bash", "args": {"command": "ls -la"}}}),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "tool.result", "toolCallId": "tool_1", "result": {"output": "file.txt"}}}),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "content.part", "part": {"type": "text", "text": "Done."}}}),
+            json.dumps({"type": "context.append_loop_event", "time": 1783000001000, "event": {"type": "step.end", "step": 1}}),
+            json.dumps({"type": "usage.record", "time": 1783000001000, "usage": {"inputOther": 100, "output": 20, "inputCacheRead": 50}}),
+        ]
+        (wire_dir / "wire.jsonl").write_text("\n".join(wire_lines) + "\n")
+        return session_dir
+
+    def test_native_step_reconstruction(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        kimi_dir = tmp_path / "kimi-code-sessions"
+        monkeypatch.setattr("agentstracer.parser.KIMI_SESSIONS_DIR", kimi_dir)
+
+        self._make_native_session_dir(kimi_dir, "wd_native_123456789abc", "session_00000000-0000-0000-0000-000000000001")
+
+        sessions = parse_project_sessions("wd_native_123456789abc", mock_anonymizer, source="kimi")
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session["model"] == "kimi-code/kimi-for-coding"
+        assert session["project"] == "kimi:native"
+        assert len(session["messages"]) == 2
+
+        user_msg = session["messages"][0]
+        assert user_msg["role"] == "user"
+        assert user_msg["content"] == "Run a command"
+
+        assistant_msg = session["messages"][1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["thinking"] == "I will run ls."
+        assert assistant_msg["content"] == "Done."
+        assert len(assistant_msg["tool_uses"]) == 1
+        tool = assistant_msg["tool_uses"][0]
+        assert tool["tool"] == "Bash"
+        assert tool["input"] == {"command": "ls -la"}
+        assert tool["output"] == "file.txt"
+        assert tool["status"] == "success"
+
+        assert session["stats"]["input_tokens"] == 150
+        assert session["stats"]["output_tokens"] == 20
+        assert session["stats"]["tool_uses"] == 1
+
+    def test_include_thinking_false(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        kimi_dir = tmp_path / "kimi-code-sessions"
+        monkeypatch.setattr("agentstracer.parser.KIMI_SESSIONS_DIR", kimi_dir)
+
+        self._make_native_session_dir(kimi_dir, "wd_native_123456789abc", "session_00000000-0000-0000-0000-000000000001")
+
+        sessions = parse_project_sessions("wd_native_123456789abc", mock_anonymizer, source="kimi", include_thinking=False)
+        assert len(sessions) == 1
+        assistant_msg = sessions[0]["messages"][1]
+        assert "thinking" not in assistant_msg
