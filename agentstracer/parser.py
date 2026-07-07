@@ -1715,14 +1715,14 @@ def _build_kimi_tool_use(
 
 
 def _parse_kimi_session_file(
-    filepath: Path,
+    session_dir: Path,
     anonymizer: Anonymizer,
     include_thinking: bool = True,
 ) -> dict | None:
-    """Parse a Kimi CLI context.jsonl file into structured session data."""
+    """Parse a Kimi Code session directory into structured session data."""
     messages: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {
-        "session_id": filepath.parent.name,
+        "session_id": session_dir.name,
         "cwd": None,
         "git_branch": None,
         "model": None,
@@ -1731,77 +1731,187 @@ def _parse_kimi_session_file(
     }
     stats = _make_stats()
 
+    state_file = session_dir / "state.json"
     try:
-        for entry in _iter_jsonl(filepath):
-            role = entry.get("role")
+        state = json.loads(state_file.read_text())
+        metadata["start_time"] = state.get("createdAt")
+        metadata["end_time"] = state.get("updatedAt")
+    except (OSError, json.JSONDecodeError):
+        pass
 
-            if role == "user":
-                content = entry.get("content")
-                if isinstance(content, str) and content.strip():
-                    messages.append({
-                        "role": "user",
-                        "content": anonymizer.text(content.strip()),
-                        "timestamp": None,
-                    })
-                    stats["user_messages"] += 1
+    wire_file = session_dir / "agents" / "main" / "wire.jsonl"
+    if not wire_file.exists():
+        return None
 
-            elif role == "assistant":
-                msg: dict[str, Any] = {"role": "assistant"}
+    # Pre-pass: collect tool results from migrated role=tool messages.
+    tool_result_map: dict[str, dict] = {}
+    try:
+        for entry in _iter_jsonl(wire_file):
+            if entry.get("type") != "context.append_message":
+                continue
+            msg = entry.get("message", {})
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tool_call_id = msg.get("toolCallId")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                continue
+            text_parts = _extract_kimi_text_parts(msg.get("content"), anonymizer)
+            tool_result_map[tool_call_id] = {
+                "output": "\n\n".join(text_parts),
+                "status": "success",
+            }
+    except OSError:
+        pass
 
-                content = entry.get("content")
-                text_parts = []
-                thinking_parts = []
+    current_step: dict[str, Any] | None = None
 
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        block_type = block.get("type")
-                        if block_type == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                text_parts.append(anonymizer.text(text))
-                        elif block_type == "think" and include_thinking:
-                            think = block.get("think", "").strip()
-                            if think:
-                                thinking_parts.append(anonymizer.text(think))
+    try:
+        for entry in _iter_jsonl(wire_file):
+            event_type = entry.get("type")
 
-                if text_parts:
-                    msg["content"] = "\n\n".join(text_parts)
-                if thinking_parts:
-                    msg["thinking"] = "\n\n".join(thinking_parts)
+            if event_type == "config.update":
+                if metadata["model"] is None:
+                    metadata["model"] = entry.get("modelAlias")
+                continue
 
-                tool_calls = entry.get("tool_calls", [])
-                tool_uses = []
-                if isinstance(tool_calls, list):
-                    for tc in tool_calls:
+            if event_type == "usage.record":
+                usage = entry.get("usage", {})
+                stats["input_tokens"] += _safe_int(usage.get("inputOther"))
+                stats["input_tokens"] += _safe_int(usage.get("inputCacheRead"))
+                stats["output_tokens"] += _safe_int(usage.get("output"))
+                continue
+
+            if event_type == "context.append_message":
+                msg = entry.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                timestamp = _normalize_timestamp(entry.get("time"))
+
+                if role == "user":
+                    text_parts = _extract_kimi_text_parts(msg.get("content"), anonymizer)
+                    if text_parts:
+                        messages.append({
+                            "role": "user",
+                            "content": "\n\n".join(text_parts),
+                            "timestamp": timestamp,
+                        })
+                        stats["user_messages"] += 1
+                        _update_time_bounds(metadata, timestamp)
+
+                elif role == "assistant":
+                    text_parts = _extract_kimi_text_parts(msg.get("content"), anonymizer)
+                    thinking_parts = (
+                        _extract_kimi_thinking_parts(msg.get("content"), anonymizer)
+                        if include_thinking
+                        else []
+                    )
+                    tool_uses = []
+                    for tc in msg.get("toolCalls", []):
                         if not isinstance(tc, dict):
                             continue
                         func = tc.get("function", {})
                         if isinstance(func, dict):
-                            tool_name = func.get("name")
                             args_str = func.get("arguments", "")
                             try:
                                 args = json.loads(args_str) if isinstance(args_str, str) else args_str
                             except json.JSONDecodeError:
                                 args = args_str
-                            tool_uses.append({
-                                "tool": tool_name,
-                                "input": _parse_tool_input(tool_name, args, anonymizer),
-                            })
+                            tool_use = _build_kimi_tool_use(
+                                func.get("name"),
+                                tc.get("id"),
+                                args,
+                                anonymizer,
+                            )
+                            result = tool_result_map.get(tool_use.get("id", ""))
+                            if result:
+                                tool_use["output"] = result["output"]
+                                tool_use["status"] = result["status"]
+                            tool_uses.append(tool_use)
 
-                if tool_uses:
-                    msg["tool_uses"] = tool_uses
-                    stats["tool_uses"] += len(tool_uses)
+                    assistant_msg: dict[str, Any] = {"role": "assistant"}
+                    if text_parts:
+                        assistant_msg["content"] = "\n\n".join(text_parts)
+                    if thinking_parts:
+                        assistant_msg["thinking"] = "\n\n".join(thinking_parts)
+                    if tool_uses:
+                        assistant_msg["tool_uses"] = tool_uses
+                        stats["tool_uses"] += len(tool_uses)
 
-                if text_parts or thinking_parts or tool_uses:
-                    messages.append(msg)
-                    stats["assistant_messages"] += 1
+                    if text_parts or thinking_parts or tool_uses:
+                        messages.append(assistant_msg)
+                        stats["assistant_messages"] += 1
+                        _update_time_bounds(metadata, timestamp)
 
-            elif role == "_usage":
-                token_count = entry.get("token_count")
-                if isinstance(token_count, int):
-                    stats["output_tokens"] = max(stats["output_tokens"], token_count)
+                continue
+
+            if event_type == "context.append_loop_event":
+                event = entry.get("event", {})
+                if not isinstance(event, dict):
+                    continue
+                sub_type = event.get("type")
+                timestamp = _normalize_timestamp(entry.get("time"))
+
+                if sub_type == "step.begin":
+                    current_step = {
+                        "text_parts": [],
+                        "thinking_parts": [],
+                        "tool_uses": [],
+                        "timestamp": timestamp,
+                    }
+
+                elif sub_type == "content.part" and current_step is not None:
+                    part = event.get("part", {})
+                    if not isinstance(part, dict):
+                        pass
+                    elif part.get("type") == "text":
+                        text = part.get("text", "").strip()
+                        if text:
+                            current_step["text_parts"].append(anonymizer.text(text))
+                    elif part.get("type") == "think" and include_thinking:
+                        think = part.get("think", "").strip()
+                        if think:
+                            current_step["thinking_parts"].append(anonymizer.text(think))
+
+                elif sub_type == "tool.call" and current_step is not None:
+                    args = event.get("args", {})
+                    tool_use = _build_kimi_tool_use(
+                        event.get("name"),
+                        event.get("toolCallId"),
+                        args,
+                        anonymizer,
+                    )
+                    current_step["tool_uses"].append(tool_use)
+
+                elif sub_type == "tool.result" and current_step is not None:
+                    tool_call_id = event.get("toolCallId")
+                    result = event.get("result", {})
+                    output = result.get("output", "")
+                    for tu in current_step["tool_uses"]:
+                        if tu.get("id") == tool_call_id:
+                            tu["output"] = anonymizer.text(str(output)) if isinstance(output, str) else output
+                            tu["status"] = "success"
+                            break
+
+                elif sub_type == "step.end" and current_step is not None:
+                    assistant_msg = {"role": "assistant"}
+                    if current_step["text_parts"]:
+                        assistant_msg["content"] = "\n\n".join(current_step["text_parts"])
+                    if current_step["thinking_parts"]:
+                        assistant_msg["thinking"] = "\n\n".join(current_step["thinking_parts"])
+                    if current_step["tool_uses"]:
+                        assistant_msg["tool_uses"] = current_step["tool_uses"]
+                        stats["tool_uses"] += len(current_step["tool_uses"])
+
+                    if (
+                        current_step["text_parts"]
+                        or current_step["thinking_parts"]
+                        or current_step["tool_uses"]
+                    ):
+                        messages.append(assistant_msg)
+                        stats["assistant_messages"] += 1
+                        _update_time_bounds(metadata, current_step["timestamp"])
+                    current_step = None
 
     except OSError:
         return None
