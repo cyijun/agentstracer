@@ -278,41 +278,21 @@ def _discover_openclaw_projects() -> list[dict]:
     return projects
 
 
-def _load_kimi_work_dirs() -> dict[str, str]:
-    """Load Kimi work directory mapping from config file."""
-    if not KIMI_CONFIG_PATH.exists():
-        return {}
-    try:
-        data = json.loads(KIMI_CONFIG_PATH.read_text())
-        work_dirs = data.get("work_dirs", [])
-        return {
-            entry.get("path", ""): entry.get("path", "")
-            for entry in work_dirs
-            if entry.get("path")
-        }
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _get_kimi_project_hash(cwd: str) -> str:
-    """Generate Kimi project hash from working directory path (MD5)."""
-    return hashlib.md5(cwd.encode()).hexdigest()
-
-
 def _discover_kimi_projects() -> list[dict]:
+    """Discover Kimi Code projects under ~/.kimi-code/sessions.
+
+    Layout: wd_<project_name>_<hash>/session_<uuid>/agents/main/wire.jsonl
+    """
     if not KIMI_SESSIONS_DIR.exists():
         return []
-
-    work_dirs = _load_kimi_work_dirs()
-    path_to_hash = {path: _get_kimi_project_hash(path) for path in work_dirs}
-    hash_to_path = {h: p for p, h in path_to_hash.items()}
 
     projects = []
     for project_dir in sorted(KIMI_SESSIONS_DIR.iterdir()):
         if not project_dir.is_dir():
             continue
+        if not project_dir.name.startswith("wd_"):
+            continue
 
-        project_hash = project_dir.name
         session_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
         if not session_dirs:
             continue
@@ -320,26 +300,18 @@ def _discover_kimi_projects() -> list[dict]:
         total_sessions = 0
         total_size = 0
         for session_dir in session_dirs:
-            context_file = session_dir / "context.jsonl"
-            if context_file.exists():
+            wire_file = session_dir / "agents" / "main" / "wire.jsonl"
+            if wire_file.exists():
                 total_sessions += 1
-                total_size += context_file.stat().st_size
+                total_size += wire_file.stat().st_size
 
         if total_sessions == 0:
             continue
 
-        project_path = hash_to_path.get(project_hash)
-        if project_path:
-            display_name = f"kimi:{Path(project_path).name}"
-            dir_name = project_path
-        else:
-            display_name = f"kimi:{project_hash[:8]}"
-            dir_name = project_hash
-
         projects.append(
             {
-                "dir_name": dir_name,
-                "display_name": display_name,
+                "dir_name": project_dir.name,
+                "display_name": _build_kimi_project_name(project_dir.name),
                 "session_count": total_sessions,
                 "total_size_bytes": total_size,
                 "source": KIMI_SOURCE,
@@ -348,10 +320,16 @@ def _discover_kimi_projects() -> list[dict]:
     return projects
 
 
-def _build_kimi_project_name(cwd: str) -> str:
-    if cwd == UNKNOWN_KIMI_CWD:
-        return "kimi:unknown"
-    return f"kimi:{Path(cwd).name or cwd}"
+def _build_kimi_project_name(dir_name: str) -> str:
+    """Convert wd_<name>_<hash> into a readable project name."""
+    if not dir_name.startswith("wd_"):
+        return f"kimi:{dir_name}"
+    parts = dir_name.split("_")
+    if len(parts) >= 3:
+        name = "_".join(parts[1:-1])
+    else:
+        name = dir_name
+    return f"kimi:{name or dir_name}"
 
 
 def _discover_custom_projects() -> list[dict]:
@@ -448,8 +426,7 @@ def parse_project_sessions(
         return _parse_custom_sessions(project_dir_name, anonymizer)
 
     if source == KIMI_SOURCE:
-        project_hash = _get_kimi_project_hash(project_dir_name)
-        project_path = KIMI_SESSIONS_DIR / project_hash
+        project_path = KIMI_SESSIONS_DIR / project_dir_name
         if not project_path.exists():
             return []
         sessions = []
