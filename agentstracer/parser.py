@@ -433,11 +433,11 @@ def parse_project_sessions(
         for session_dir in sorted(project_path.iterdir()):
             if not session_dir.is_dir():
                 continue
-            context_file = session_dir / "context.jsonl"
-            if not context_file.exists():
+            wire_file = session_dir / "agents" / "main" / "wire.jsonl"
+            if not wire_file.exists():
                 continue
             parsed = _parse_kimi_session_file(
-                context_file,
+                session_dir,
                 anonymizer=anonymizer,
                 include_thinking=include_thinking,
             )
@@ -445,7 +445,7 @@ def parse_project_sessions(
                 parsed["project"] = _build_kimi_project_name(project_dir_name)
                 parsed["source"] = KIMI_SOURCE
                 if not parsed.get("model"):
-                    parsed["model"] = "kimi-k2"
+                    parsed["model"] = "kimi-code"
                 sessions.append(parsed)
         return sessions
 
