@@ -41,7 +41,6 @@ OPENCLAW_AGENTS_DIR = OPENCLAW_DIR / "agents"
 UNKNOWN_OPENCLAW_CWD = "<unknown-cwd>"
 
 KIMI_SESSIONS_DIR = Path.home() / ".kimi-code" / "sessions"
-UNKNOWN_KIMI_CWD = "<unknown-cwd>"
 
 CUSTOM_DIR = Path.home() / ".agentstracer" / "custom"
 
@@ -287,36 +286,39 @@ def _discover_kimi_projects() -> list[dict]:
         return []
 
     projects = []
-    for project_dir in sorted(KIMI_SESSIONS_DIR.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        if not project_dir.name.startswith("wd_"):
-            continue
+    try:
+        for project_dir in sorted(KIMI_SESSIONS_DIR.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            if not project_dir.name.startswith("wd_"):
+                continue
 
-        session_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
-        if not session_dirs:
-            continue
+            session_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
+            if not session_dirs:
+                continue
 
-        total_sessions = 0
-        total_size = 0
-        for session_dir in session_dirs:
-            wire_file = session_dir / "agents" / "main" / "wire.jsonl"
-            if wire_file.exists():
-                total_sessions += 1
-                total_size += wire_file.stat().st_size
+            total_sessions = 0
+            total_size = 0
+            for session_dir in session_dirs:
+                wire_file = session_dir / "agents" / "main" / "wire.jsonl"
+                if wire_file.exists():
+                    total_sessions += 1
+                    total_size += wire_file.stat().st_size
 
-        if total_sessions == 0:
-            continue
+            if total_sessions == 0:
+                continue
 
-        projects.append(
-            {
-                "dir_name": project_dir.name,
-                "display_name": _build_kimi_project_name(project_dir.name),
-                "session_count": total_sessions,
-                "total_size_bytes": total_size,
-                "source": KIMI_SOURCE,
-            }
-        )
+            projects.append(
+                {
+                    "dir_name": project_dir.name,
+                    "display_name": _build_kimi_project_name(project_dir.name),
+                    "session_count": total_sessions,
+                    "total_size_bytes": total_size,
+                    "source": KIMI_SOURCE,
+                }
+            )
+    except OSError:
+        return []
     return projects
 
 
