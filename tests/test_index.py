@@ -26,6 +26,7 @@ def index_conn(tmp_path, monkeypatch):
     """Open an index DB in a temp directory."""
     monkeypatch.setattr("agentstracer.index.INDEX_DB", tmp_path / "index.db")
     monkeypatch.setattr("agentstracer.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("agentstracer.index.CONFIG_DIR", tmp_path / "agentstracer_config")
     conn = open_index()
     yield conn
     conn.close()

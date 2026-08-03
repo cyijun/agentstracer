@@ -1,16 +1,13 @@
 """Tests for the workbench daemon HTTP API."""
 
 import json
-import time
-import urllib.error
 from http.client import HTTPConnection
-from io import BytesIO
 from threading import Thread
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from agentstracer.daemon import WorkbenchHandler, run_server, _SHARE_COOLDOWN_SECONDS
+from agentstracer.daemon import WorkbenchHandler, run_server
 from agentstracer.index import open_index, upsert_sessions
 
 
@@ -173,7 +170,7 @@ class TestStaticServing:
 
 class TestRunServerPortFallback:
     def test_fallback_to_free_port_on_oserror(self, index_setup):
-        """If the default port is busy, run_server falls back to port 0 and opens the browser."""
+        """If the default port is busy, run_server falls back without opening a browser."""
         from http.server import ThreadingHTTPServer
 
         real_server = MagicMock()
@@ -194,42 +191,11 @@ class TestRunServerPortFallback:
              patch("webbrowser.open") as mock_open:
             run_server(port=8384, open_browser=True)
 
-        mock_open.assert_called_once_with("http://localhost:9999/traces")
-
-
-def _mock_urlopen_factory(register_response=None, upload_response=None, upload_error=None):
-    """Create a mock urlopen that handles /register and /upload calls."""
-    register_resp = register_response or {
-        "device_id": "test-device-id-0000-0000-000000000000",
-        "device_token": "test-device-token-abc123",
-    }
-    upload_resp = upload_response or {
-        "ok": True,
-    }
-
-    def mock_urlopen(req, **kwargs):
-        url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "/register" in url:
-            resp = MagicMock()
-            resp.read.return_value = json.dumps(register_resp).encode()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
-        elif "/upload" in url:
-            if upload_error:
-                raise upload_error
-            resp = MagicMock()
-            resp.read.return_value = json.dumps(upload_resp).encode()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
-        raise ValueError(f"Unexpected URL: {url}")
-
-    return mock_urlopen
+        mock_open.assert_not_called()
 
 
 class TestShareAPI:
-    """Tests for the share-to-GCS HTTP upload flow."""
+    """The workbench remains local-only; Langfuse has its own explicit CLI."""
 
     def _create_and_export_bundle(self, port):
         """Helper: create a bundle and export it, return bundle_id."""
@@ -245,205 +211,8 @@ class TestShareAPI:
         assert data["ok"] is True
         return bundle_id
 
-    def test_share_success(self, server, monkeypatch):
-        """Full success path: create, export, share via HTTP."""
-        # Reset rate limit timer
-        WorkbenchHandler._last_share_time = 0.0
-
+    def test_share_is_explicitly_disabled(self, server):
         bundle_id = self._create_and_export_bundle(server)
-
-        mock_urlopen = _mock_urlopen_factory()
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 200
-        assert data["ok"] is True
-        assert "gcs_uri" not in data
-        assert "shared_at" in data
-        assert data["bundle_hash"]
-        assert "redaction_summary" in data
-        assert isinstance(data["redaction_summary"]["total_redactions"], int)
-        assert isinstance(data["redaction_summary"]["by_type"], dict)
-
-    def test_share_rate_limiting(self, server, monkeypatch):
-        """Two shares within cooldown → second gets 429."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        mock_urlopen = _mock_urlopen_factory()
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-        assert status == 200
-
-        # Immediately try again — should be rate limited
         status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-        assert status == 429
-        assert "Rate limited" in data["error"]
-
-    def test_share_duplicate_prevention(self, server, monkeypatch):
-        """Already-shared bundle → 409 (unless force=true)."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        mock_urlopen = _mock_urlopen_factory()
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, _ = _post(server, f"/api/bundles/{bundle_id}/share")
-        assert status == 200
-
-        # Second share without force → 409
-        WorkbenchHandler._last_share_time = 0.0
-        status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-        assert status == 409
-        assert "already shared" in data["error"]
-
-        # With force=true → should re-share
-        WorkbenchHandler._last_share_time = 0.0
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share", {"force": True})
-        assert status == 200
-        assert data["ok"] is True
-
-    def test_share_http_error(self, server, monkeypatch):
-        """HTTP error from ingest → daemon returns 502."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        error_resp = BytesIO(json.dumps({"error": "Internal server error"}).encode())
-        http_error = urllib.error.HTTPError(
-            url="http://test/upload",
-            code=500,
-            msg="Internal Server Error",
-            hdrs={},  # type: ignore[arg-type]
-            fp=error_resp,
-        )
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        mock_urlopen = _mock_urlopen_factory(upload_error=http_error)
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 502
-        assert "error" in data
-
-    def test_share_cf_409_treated_as_success(self, server, monkeypatch):
-        """Cloud Function 409 (already in GCS) → daemon treats as success."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        error_resp = BytesIO(json.dumps({"error": "Bundle already uploaded"}).encode())
-        http_error = urllib.error.HTTPError(
-            url="http://test/upload",
-            code=409,
-            msg="Conflict",
-            hdrs={},  # type: ignore[arg-type]
-            fp=error_resp,
-        )
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        mock_urlopen = _mock_urlopen_factory(upload_error=http_error)
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 200
-        assert data["ok"] is True
-        assert "gcs_uri" not in data
-        assert data["shared_at"]
-
-    def test_share_network_failure(self, server, monkeypatch):
-        """Network failure → daemon returns 502 with friendly message."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        network_error = urllib.error.URLError("Connection refused")
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "test-dev-id",
-            "device_token": "test-dev-token",
-        })
-        mock_urlopen = _mock_urlopen_factory(upload_error=network_error)
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 502
-        assert "Could not reach upload service" in data["error"]
-
-    def test_device_token_auto_registered(self, server, monkeypatch, tmp_path):
-        """Device token is auto-registered on first share."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        # Start with no device credentials
-        saved_configs = []
-        original_load = lambda: {"repo": None, "source": None, "excluded_projects": [], "redact_strings": []}
-
-        def tracking_save(config):
-            saved_configs.append(dict(config))
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", original_load)
-        monkeypatch.setattr("agentstracer.daemon.save_config", tracking_save)
-
-        mock_urlopen = _mock_urlopen_factory()
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 200
-        # Verify config was saved with device credentials
-        assert len(saved_configs) == 1
-        assert saved_configs[0]["device_id"] == "test-device-id-0000-0000-000000000000"
-        assert saved_configs[0]["device_token"] == "test-device-token-abc123"
-
-    def test_device_token_reused(self, server, monkeypatch):
-        """Existing device token is reused without extra /register call."""
-        WorkbenchHandler._last_share_time = 0.0
-
-        bundle_id = self._create_and_export_bundle(server)
-
-        monkeypatch.setattr("agentstracer.daemon.load_config", lambda: {
-            "device_id": "existing-device-id",
-            "device_token": "existing-device-token",
-        })
-
-        register_called = []
-
-        def mock_urlopen(req, **kwargs):
-            url = req.full_url if hasattr(req, "full_url") else str(req)
-            if "/register" in url:
-                register_called.append(True)
-            resp = MagicMock()
-            resp.read.return_value = json.dumps({
-                "ok": True,
-            }).encode()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
-
-        with patch("agentstracer.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/bundles/{bundle_id}/share")
-
-        assert status == 200
-        assert "gcs_uri" not in data
-        assert len(register_called) == 0  # No /register call made
+        assert status == 503
+        assert "local-only" in data["error"]

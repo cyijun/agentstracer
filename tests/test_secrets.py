@@ -111,6 +111,11 @@ class TestScanText:
         findings = scan_text(key)
         assert any(f["type"] == "openai_key" for f in findings)
 
+    def test_langfuse_secret_key(self):
+        key = "sk-lf-12345678-1234-1234-1234-123456789abc"
+        findings = scan_text(key)
+        assert any(f["type"] == "langfuse_secret" for f in findings)
+
     def test_hf_token(self):
         token = "hf_" + "a" * 30
         findings = scan_text(token)

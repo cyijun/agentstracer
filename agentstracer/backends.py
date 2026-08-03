@@ -95,7 +95,12 @@ def _detect_current_agent_from_process_tree(pid: int | None = None, *, max_depth
 
 def detect_current_agent(env: dict[str, str] | None = None) -> str | None:
     """Detect the current coding agent from env vars or process tree."""
-    return _detect_current_agent_from_env(env) or _detect_current_agent_from_process_tree()
+    detected = _detect_current_agent_from_env(env)
+    if detected or env is not None:
+        # An explicit mapping is a complete, deterministic detection context
+        # (and is how callers/tests intentionally suppress ambient state).
+        return detected
+    return _detect_current_agent_from_process_tree()
 
 
 def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) -> str:

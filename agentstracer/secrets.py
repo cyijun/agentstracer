@@ -20,6 +20,9 @@ SECRET_PATTERNS = [
     # Anthropic API keys
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
 
+    # Langfuse secret keys (the embedded hyphens do not match OpenAI keys)
+    ("langfuse_secret", re.compile(r"sk-lf-[A-Za-z0-9-]{30,}")),
+
     # OpenAI API keys
     ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
 
@@ -114,7 +117,7 @@ SECRET_PATTERNS = [
 # Low (<0.70): heuristic/PII, may be false positives.
 CONFIDENCE: dict[str, float] = {
     "jwt": 0.98, "private_key": 0.98,
-    "anthropic_key": 0.98, "openai_key": 0.98,
+    "anthropic_key": 0.98, "openai_key": 0.98, "langfuse_secret": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
     "pypi_token": 0.98, "npm_token": 0.98,
     "aws_key": 0.98, "aws_secret": 0.95,

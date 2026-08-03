@@ -1202,6 +1202,7 @@ class _CodexParseState:
     max_input_tokens: int = 0
     max_output_tokens: int = 0
     tool_result_map: dict[str, dict] = dataclasses.field(default_factory=dict)
+    use_response_messages: bool = False
 
 
 def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
@@ -1218,6 +1219,8 @@ def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anon
 
         if pt == "function_call_output":
             raw = p.get("output", "")
+            if not isinstance(raw, str):
+                raw = json.dumps(raw, ensure_ascii=False, default=str)
             # Parse "Exit code: N\nWall time: ...\nOutput:\n..." format
             out: dict = {}
             lines = raw.splitlines()
@@ -1237,25 +1240,38 @@ def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anon
                     output_lines.append(line)
             if output_lines:
                 out["output"] = anonymizer.text("\n".join(output_lines).strip())
-            result[call_id] = {"output": out, "status": "success"}
+            elif raw.strip() and not out:
+                # Newer Codex versions can return structured arrays/objects,
+                # or a plain string without the legacy "Output:" envelope.
+                # Preserve that payload instead of dropping the tool result.
+                out["output"] = anonymizer.text(raw.strip())
+            exit_code = out.get("exit_code")
+            status = "error" if exit_code not in (None, 0, "0") else "success"
+            result[call_id] = {"output": out, "status": status}
 
         elif pt == "custom_tool_call_output":
             raw = p.get("output", "")
             out = {}
             try:
-                parsed = json.loads(raw)
-                text = parsed.get("output", "")
-                if text:
-                    out["output"] = anonymizer.text(str(text))
-                meta = parsed.get("metadata", {})
-                if "exit_code" in meta:
-                    out["exit_code"] = meta["exit_code"]
-                if "duration_seconds" in meta:
-                    out["duration_seconds"] = meta["duration_seconds"]
-            except (json.JSONDecodeError, AttributeError):
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict):
+                    text = parsed.get("output", "")
+                    if text:
+                        out["output"] = anonymizer.text(str(text))
+                    meta = parsed.get("metadata", {})
+                    if isinstance(meta, dict):
+                        if "exit_code" in meta:
+                            out["exit_code"] = meta["exit_code"]
+                        if "duration_seconds" in meta:
+                            out["duration_seconds"] = meta["duration_seconds"]
+                elif parsed is not None:
+                    out["output"] = anonymizer.text(json.dumps(parsed, ensure_ascii=False, default=str))
+            except json.JSONDecodeError:
                 if raw:
-                    out["output"] = anonymizer.text(raw)
-            result[call_id] = {"output": out, "status": "success"}
+                    out["output"] = anonymizer.text(str(raw))
+            exit_code = out.get("exit_code")
+            status = "error" if exit_code not in (None, 0, "0") else "success"
+            result[call_id] = {"output": out, "status": status}
 
     return result
 
@@ -1284,6 +1300,11 @@ def _parse_codex_session_file(
         return None
 
     state.tool_result_map = _build_codex_tool_result_map(entries, anonymizer)
+    state.use_response_messages = not any(
+        entry.get("type") == "event_msg"
+        and entry.get("payload", {}).get("type") in ("user_message", "agent_message")
+        for entry in entries
+    )
 
     for entry in entries:
         timestamp = _normalize_timestamp(entry.get("timestamp"))
@@ -1294,7 +1315,7 @@ def _parse_codex_session_file(
         elif entry_type == "turn_context":
             _handle_codex_turn_context(state, entry, anonymizer)
         elif entry_type == "response_item":
-            _handle_codex_response_item(state, entry, anonymizer, include_thinking)
+            _handle_codex_response_item(state, entry, timestamp, anonymizer, include_thinking)
         elif entry_type == "event_msg":
             payload = entry.get("payload", {})
             event_type = payload.get("type")
@@ -1365,7 +1386,8 @@ def _handle_codex_turn_context(
 
 
 def _handle_codex_response_item(
-    state: _CodexParseState, entry: dict[str, Any], anonymizer: Anonymizer,
+    state: _CodexParseState, entry: dict[str, Any], timestamp: str | None,
+    anonymizer: Anonymizer,
     include_thinking: bool,
 ) -> None:
     payload = entry.get("payload", {})
@@ -1401,6 +1423,48 @@ def _handle_codex_response_item(
                 if cleaned not in state._pending_thinking_seen:
                     state._pending_thinking_seen.add(cleaned)
                     state.pending_thinking.append(cleaned)
+    elif item_type == "message" and state.use_response_messages:
+        role = payload.get("role")
+        content = payload.get("content", [])
+        text_parts = []
+        if isinstance(content, str):
+            text_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+        text = "\n\n".join(text_parts).strip()
+        if not text:
+            return
+        if role == "user":
+            _flush_codex_pending(state, timestamp)
+            state.messages.append({
+                "role": "user",
+                "content": anonymizer.text(text),
+                "timestamp": timestamp,
+            })
+            state.stats["user_messages"] += 1
+            _update_time_bounds(state.metadata, timestamp)
+        elif role == "assistant":
+            msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": anonymizer.text(text),
+                "timestamp": timestamp,
+            }
+            if state.pending_thinking and include_thinking:
+                msg["thinking"] = "\n\n".join(state.pending_thinking)
+            if state.pending_tool_uses:
+                msg["tool_uses"] = _resolve_codex_tool_uses(state)
+            state.messages.append(msg)
+            state.stats["assistant_messages"] += 1
+            state.stats["tool_uses"] += len(msg.get("tool_uses", []))
+            _update_time_bounds(state.metadata, timestamp)
+            state.pending_tool_uses.clear()
+            state.pending_thinking.clear()
+            state._pending_thinking_seen.clear()
 
 
 def _handle_codex_token_count(state: _CodexParseState, payload: dict[str, Any]) -> None:
@@ -1967,7 +2031,11 @@ def _build_openclaw_project_index() -> dict[str, list[Path]]:
             # Discover all session files: .jsonl, .jsonl.reset.*, .jsonl.deleted.*
             for session_file in sorted(sessions_dir.glob("*.jsonl*")):
                 # Skip non-session files like sessions.json index
-                if session_file.suffix == ".json" or not session_file.is_file():
+                if (
+                    session_file.suffix == ".json"
+                    or ".trajectory.jsonl" in session_file.name
+                    or not session_file.is_file()
+                ):
                     continue
                 cwd = _extract_openclaw_cwd(session_file) or UNKNOWN_OPENCLAW_CWD
                 index.setdefault(cwd, []).append(session_file)
