@@ -23,11 +23,11 @@ pip install -e .
 ### 基本使用
 
 ```bash
-# 1. 配置导出源（claude/kimi/codex/gemini/all）
-agentstracer config --source all
+# 1. 配置导出源并明确确认项目范围
+agentstracer config --source all --confirm-projects
 
 # 2. 导出对话记录
-agentstracer export --no-push -o my_conversations.jsonl
+agentstracer export -o my_conversations.jsonl
 ```
 
 ### 私人使用（保留 API Keys）
@@ -37,9 +37,9 @@ agentstracer export --no-push -o my_conversations.jsonl
 agentstracer config --no-secrets-redaction
 
 # 导出（包含原始 API keys）
-agentstracer export --no-push -o my_data.jsonl
+agentstracer export -o my_data.jsonl
 
-# ⚠️ 警告：此文件包含明文 API keys，请勿分享！
+# ⚠️ 此模式仅适合隔离的本机存储；文件可能包含明文凭据，绝对不要分享或同步。
 ```
 
 ### 其他命令
@@ -48,7 +48,7 @@ agentstracer export --no-push -o my_data.jsonl
 # 列出发现的项目
 agentstracer list
 
-# 启动本地 Web UI
+# 启动本地 Workbench API（当前发行包不包含浏览器前端）
 agentstracer serve
 
 # 查看配置
@@ -83,14 +83,14 @@ agentstracer langfuse sync --source all --verify
 
 ## 支持的 AI 工具
 
-| 工具 | 数据位置 | 状态 |
-|------|---------|------|
-| Claude Code | `~/.claude/projects/` | ✅ |
-| Kimi Code CLI | `~/.kimi-code/sessions/` | ✅ |
-| Codex CLI | `~/.codex/sessions/` | ✅ |
-| OpenCode | `~/.local/share/opencode/` | ✅ |
-| OpenClaw | `~/.openclaw/` | ✅ |
-| Gemini CLI | `~/.gemini/tmp/` | ✅ |
+| 工具 | 数据位置 | JSONL 导出 | Workbench 索引 |
+|------|---------|------------|----------------|
+| Claude Code | `~/.claude/projects/` | ✅ | ✅ |
+| Kimi Code CLI | `~/.kimi-code/sessions/` | ✅ | — |
+| Codex CLI | `~/.codex/sessions/` | ✅ | ✅ |
+| OpenCode | `~/.local/share/opencode/` | ✅ | — |
+| OpenClaw | `~/.openclaw/` | ✅ | ✅ |
+| Gemini CLI | `~/.gemini/tmp/` | ✅ | — |
 
 ---
 
@@ -136,7 +136,7 @@ agentstracer langfuse sync --source all --verify
 
 ## 关于本版本
 
-这是 [AgentsTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，默认专注于**本地隐私保护**；只有显式执行 `agentstracer langfuse sync` 才会向用户配置的 Langfuse 服务发送数据。
+这是 [AgentsTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，默认专注于**本地隐私保护**。普通导出和 Workbench 留在本机；只有显式执行 `agentstracer langfuse doctor`、`smoke` 或 `sync` 时才会访问用户配置的 Langfuse 服务，其中 `smoke` 和 `sync` 会写入远端。
 
 ### 主要修改点
 

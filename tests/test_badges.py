@@ -66,6 +66,12 @@ class TestOutcomeBadge:
         ])
         assert compute_outcome_badge(session) == "analysis_only"
 
+    def test_analysis_only_read_tools_case_insensitive(self):
+        session = _make_session(tool_uses=[
+            {"tool": "read", "input": {"file_path": "foo.py"}, "output": "content", "status": "success"},
+        ])
+        assert compute_outcome_badge(session) == "analysis_only"
+
     def test_completed_write_only(self):
         """Write tool with no test output and no errors, assistant replied -> completed."""
         session = _make_session(tool_uses=[
@@ -79,6 +85,22 @@ class TestOutcomeBadge:
             {"tool": "Bash", "input": {"command": "python app.py"}, "output": "Traceback (most recent call last):\n  File 'app.py', line 5\nNameError: name 'foo' is not defined", "status": "error"},
         ])
         assert compute_outcome_badge(session) == "errored"
+
+    def test_explicit_error_status_is_authoritative_without_error_text(self):
+        session = _make_session(tool_uses=[
+            {"tool": "Write", "input": {"file_path": "foo.py"}, "output": "exit code 1", "status": "error"},
+        ])
+        assert compute_outcome_badge(session) == "errored"
+
+    def test_nonzero_structured_exit_code_is_errored(self):
+        session = _make_session(tool_uses=[
+            {"tool": "Bash", "input": {"command": "run"}, "output": {"exit_code": 2}, "status": "success"},
+        ])
+        assert compute_outcome_badge(session) == "errored"
+
+    def test_build_success_is_not_mislabeled_as_tests_passed(self):
+        session = _make_session(tool_output="BUILD SUCCESSFUL")
+        assert compute_outcome_badge(session) == "completed"
 
     def test_partial_user_interrupted(self):
         """Session where user was the last speaker -> partial."""
@@ -95,6 +117,10 @@ class TestValueBadges:
         session = _make_session(user_messages=25, input_tokens=60000, output_tokens=50000)
         badges = compute_value_badges(session)
         assert "long_horizon" in badges
+
+    def test_long_horizon_includes_documented_boundary(self):
+        session = _make_session(user_messages=20, input_tokens=60_000, output_tokens=40_000)
+        assert "long_horizon" in compute_value_badges(session)
 
     def test_long_horizon_not_tokens_only(self):
         # High tokens alone should NOT trigger (needs 20+ user messages too)
@@ -186,6 +212,10 @@ class TestTaskType:
         session = _make_session("hello")
         session["stats"]["tool_uses"] = 0
         assert compute_task_type(session) == "trivial"
+
+    def test_greeting_with_tool_activity_is_not_trivial(self):
+        session = _make_session("hello", tool_use_count=2)
+        assert compute_task_type(session) != "trivial"
 
     def test_trivial_slash_command(self):
         session = _make_session("/clear")

@@ -13,9 +13,11 @@ Output: one JSONL line per turn (user message -> agent loop -> reply).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
-import uuid
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -135,13 +137,27 @@ def group_turns(msgs: list[dict]) -> list[dict]:
       work_msgs: list of intermediate assistant messages (WORK)
       reply_msg: the final assistant message (REPLY), or None
     """
+    def finish(turn: dict | None) -> None:
+        if turn is None:
+            return
+        # OpenClaw marks replies explicitly.  Other providers generally do
+        # not, so a final content-only assistant message is the reply when it
+        # is the last assistant record in the turn.
+        if turn["reply_msg"] is None and turn["work_msgs"]:
+            candidate = turn["work_msgs"][-1]
+            if (
+                str(candidate.get("content") or "").strip()
+                and not candidate.get("tool_uses")
+            ):
+                turn["reply_msg"] = turn["work_msgs"].pop()
+        turns.append(turn)
+
     turns: list[dict] = []
     current: dict | None = None
     for msg in msgs:
         role = msg.get("role")
         if role == "user":
-            if current is not None:
-                turns.append(current)
+            finish(current)
             current = {"user_msg": msg, "work_msgs": [], "reply_msg": None}
         elif role == "assistant" and current is not None:
             content = msg.get("content") or ""
@@ -149,8 +165,7 @@ def group_turns(msgs: list[dict]) -> list[dict]:
                 current["reply_msg"] = msg
             else:
                 current["work_msgs"].append(msg)
-    if current is not None:
-        turns.append(current)
+    finish(current)
     return turns
 
 
@@ -158,13 +173,34 @@ def group_turns(msgs: list[dict]) -> list[dict]:
 # Output building
 # ---------------------------------------------------------------------------
 
-def _make_tc_id() -> str:
-    return f"tc_{uuid.uuid4().hex[:8]}"
+def _make_tc_id(namespace: str, ordinal: int, tool_name: str) -> str:
+    encoded = json.dumps(
+        [namespace, ordinal, tool_name], ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "tc_" + hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _result_status(
+    declared_status: Any,
+    raw_output: dict | None,
+    *,
+    default: str,
+) -> str:
+    raw_status = raw_output.get("status") if isinstance(raw_output, dict) else None
+    value = str(raw_status or declared_status or "").strip().lower()
+    if value in {"error", "failed", "failure", "cancelled", "canceled", "timeout"}:
+        return "error"
+    if value in {"success", "succeeded", "completed", "complete", "ok"}:
+        return "success"
+    return default
 
 
 def build_output_sequence(
     work_msgs: list[dict],
     reply_msg: dict | None,
+    *,
+    id_namespace: str = "training-turn",
 ) -> list[dict]:
     """Convert WORK messages + REPLY into a flat output sequence.
 
@@ -173,6 +209,7 @@ def build_output_sequence(
     """
     output: list[dict] = []
     pending_async: dict[str, tuple[str, dict]] = {}
+    tool_ordinal = 0
 
     for msg in work_msgs:
         thinking = msg.get("thinking") or ""
@@ -198,14 +235,22 @@ def build_output_sequence(
             if tool_name == "process" and raw_input.get("sessionId"):
                 session_id = raw_input["sessionId"]
                 if session_id in pending_async:
-                    tc_id, _ = pending_async.pop(session_id)
+                    tc_id, clean_input = pending_async[session_id]
                     result_text = ""
                     if raw_output:
                         result_text = raw_output.get("text") or ""
-                    if result_text and result_text != f"No session found for {session_id}":
+                    next_session_id = _is_still_running(raw_output)
+                    if next_session_id:
+                        if next_session_id != session_id:
+                            pending_async.pop(session_id)
+                            pending_async[next_session_id] = (tc_id, clean_input)
+                        continue
+                    pending_async.pop(session_id)
+                    if result_text and f"No session found for {session_id}" not in result_text:
                         output.append({
                             "type": "tool_result", "id": tc_id,
-                            "output": clean_tool_output(result_text), "status": "success",
+                            "output": clean_tool_output(result_text),
+                            "status": _result_status(status, raw_output, default="success"),
                         })
                     else:
                         output.append({
@@ -217,7 +262,8 @@ def build_output_sequence(
                 continue
 
             # Regular tool call
-            tc_id = _make_tc_id()
+            tc_id = _make_tc_id(id_namespace, tool_ordinal, tool_name)
+            tool_ordinal += 1
             clean_input = clean_tool_input(tool_name, raw_input)
             output.append({
                 "type": "tool_call", "id": tc_id,
@@ -231,7 +277,8 @@ def build_output_sequence(
                 result_text = (raw_output.get("text") or "") if raw_output else ""
                 output.append({
                     "type": "tool_result", "id": tc_id,
-                    "output": clean_tool_output(result_text), "status": status,
+                    "output": clean_tool_output(result_text),
+                    "status": _result_status(status, raw_output, default="unknown"),
                 })
 
     # Unresolved async execs
@@ -257,13 +304,19 @@ def build_output_sequence(
 
 def _extract_session_stats(session: dict) -> dict:
     """Extract session-level stats useful for filtering/analysis."""
+    raw_stats = session.get("stats")
+    nested: dict[Any, Any] = raw_stats if isinstance(raw_stats, dict) else {}
+
+    def value(key: str) -> Any:
+        return nested.get(key, session.get(key))
+
     return {
-        "user_messages": session.get("user_messages"),
-        "assistant_messages": session.get("assistant_messages"),
-        "tool_uses": session.get("tool_uses"),
-        "input_tokens": session.get("input_tokens"),
-        "output_tokens": session.get("output_tokens"),
-        "duration_seconds": session.get("duration_seconds"),
+        "user_messages": value("user_messages"),
+        "assistant_messages": value("assistant_messages"),
+        "tool_uses": value("tool_uses"),
+        "input_tokens": value("input_tokens"),
+        "output_tokens": value("output_tokens"),
+        "duration_seconds": value("duration_seconds"),
     }
 
 
@@ -286,7 +339,10 @@ def convert_session(session: dict) -> list[dict]:
         user_text = extract_user_text(turn["user_msg"].get("content") or "")
         if not user_text:
             continue
-        output_seq = build_output_sequence(turn["work_msgs"], turn["reply_msg"])
+        output_seq = build_output_sequence(
+            turn["work_msgs"], turn["reply_msg"],
+            id_namespace=f"{session_id}:{turn_idx}",
+        )
         if not output_seq:
             continue
 
@@ -315,13 +371,25 @@ def convert_sessions_to_training(
     """
     total_turns = 0
     total_sessions = 0
-    with open(output_path, "w", encoding="utf-8") as out:
-        for session in sessions:
-            total_sessions += 1
-            turns = convert_session(session)
-            for turn in turns:
-                out.write(json.dumps(turn, ensure_ascii=False) + "\n")
-                total_turns += 1
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            for session in sessions:
+                total_sessions += 1
+                turns = convert_session(session)
+                for turn in turns:
+                    out.write(json.dumps(turn, ensure_ascii=False) + "\n")
+                    total_turns += 1
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_path, output_path)
+        os.chmod(output_path, 0o600)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return {
         "sessions": total_sessions,

@@ -190,41 +190,49 @@ _TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 def _iter_all_text(session: dict) -> list[str]:
     """Collect all textual content from a session into a flat list."""
     texts: list[str] = []
+
+    def collect(value) -> None:
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
     for msg in session.get("messages", []):
-        if msg.get("content"):
-            texts.append(msg["content"])
-        if msg.get("thinking"):
-            texts.append(msg["thinking"])
+        if not isinstance(msg, dict):
+            continue
+        collect(msg.get("content"))
+        collect(msg.get("thinking"))
         for tu in msg.get("tool_uses", []):
-            inp = tu.get("input")
-            if isinstance(inp, str):
-                texts.append(inp)
-            elif isinstance(inp, dict):
-                for v in inp.values():
-                    if isinstance(v, str):
-                        texts.append(v)
-            out = tu.get("output")
-            if isinstance(out, str):
-                texts.append(out)
-            elif isinstance(out, dict):
-                for v in out.values():
-                    if isinstance(v, str):
-                        texts.append(v)
+            if isinstance(tu, dict):
+                collect(tu.get("input"))
+                collect(tu.get("output"))
     return texts
 
 
 def _iter_tool_outputs(session: dict) -> list[str]:
     """Collect all tool-use output strings."""
     outputs: list[str] = []
+
+    def collect(value) -> None:
+        if isinstance(value, str):
+            outputs.append(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
     for msg in session.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
         for tu in msg.get("tool_uses", []):
-            out = tu.get("output")
-            if isinstance(out, str):
-                outputs.append(out)
-            elif isinstance(out, dict):
-                for v in out.values():
-                    if isinstance(v, str):
-                        outputs.append(v)
+            if isinstance(tu, dict):
+                collect(tu.get("output"))
     return outputs
 
 
@@ -232,7 +240,11 @@ def _get_all_tool_uses(session: dict) -> list[dict]:
     """Return a flat list of every tool_use dict in the session."""
     tool_uses: list[dict] = []
     for msg in session.get("messages", []):
-        tool_uses.extend(msg.get("tool_uses", []))
+        if not isinstance(msg, dict):
+            continue
+        values = msg.get("tool_uses", [])
+        if isinstance(values, list):
+            tool_uses.extend(value for value in values if isinstance(value, dict))
     return tool_uses
 
 
@@ -241,7 +253,10 @@ def _get_user_messages(session: dict) -> list[str]:
     return [
         msg["content"]
         for msg in session.get("messages", [])
-        if msg.get("role") == "user" and msg.get("content")
+        if isinstance(msg, dict)
+        and msg.get("role") == "user"
+        and isinstance(msg.get("content"), str)
+        and msg.get("content")
     ]
 
 
@@ -260,13 +275,26 @@ def compute_outcome_badge(session: dict) -> str:
     if not tool_uses:
         return "analysis_only"
 
-    # Check if all tools are read-only
-    tool_names = {tu.get("tool", "") for tu in tool_uses}
-    if tool_names and tool_names <= _READ_ONLY_TOOLS:
+    explicit_tool_failure = False
+    for tool_use in tool_uses:
+        status = str(tool_use.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure", "cancelled", "canceled"}:
+            explicit_tool_failure = True
+        for container in (tool_use, tool_use.get("output")):
+            if not isinstance(container, dict):
+                continue
+            for key in ("exit_code", "returncode", "return_code"):
+                code = container.get(key)
+                if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+                    explicit_tool_failure = True
+
+    # Check if all tools are read-only (unless one explicitly failed).
+    read_only_tools = {name.casefold() for name in _READ_ONLY_TOOLS}
+    tool_names = {str(tu.get("tool", "")).casefold() for tu in tool_uses}
+    if not explicit_tool_failure and tool_names and tool_names <= read_only_tools:
         return "analysis_only"
 
     outputs = _iter_tool_outputs(session)
-    combined = "\n".join(outputs)
 
     # Check for test results -- scan in priority order (failures trump passes)
     has_test_pass = False
@@ -303,7 +331,7 @@ def compute_outcome_badge(session: dict) -> str:
             has_test_pass = True
         if re.search(r"Tests?:\s+\d+\s+passed,\s+\d+\s+total", output):
             has_test_pass = True
-        if re.search(r"✓|All tests passed|BUILD SUCCESSFUL", output):
+        if re.search(r"✓|All tests passed", output):
             has_test_pass = True
 
     # Priority: test failures > build failures > test passes
@@ -311,6 +339,8 @@ def compute_outcome_badge(session: dict) -> str:
         return "tests_failed"
     if has_build_fail:
         return "build_failed"
+    if explicit_tool_failure:
+        return "errored"
     if has_test_pass:
         return "tests_passed"
 
@@ -368,7 +398,7 @@ def compute_value_badges(session: dict) -> list[str]:
     # long_horizon: truly extended sessions (require both many turns AND high tokens)
     user_msgs = stats.get("user_messages", 0)
     total_tokens = stats.get("input_tokens", 0) + stats.get("output_tokens", 0)
-    if user_msgs > 20 and total_tokens > 100_000:
+    if user_msgs >= 20 and total_tokens >= 100_000:
         badges.append("long_horizon")
 
     # tool_rich
@@ -515,10 +545,10 @@ def compute_task_type(session: dict) -> str:
     # Detect trivial sessions: slash commands, greetings, warmups
     stats = session.get("stats", {})
     total_msgs = stats.get("user_messages", 0) + stats.get("assistant_messages", 0)
-    tool_uses = stats.get("tool_uses", 0)
+    tool_uses = stats.get("tool_uses", len(_get_all_tool_uses(session)))
     first_user_msg = user_msgs[0] if user_msgs else ""
 
-    if total_msgs <= 10 and _TRIVIAL_RE.match(first_user_msg.strip()):
+    if total_msgs <= 10 and tool_uses == 0 and _TRIVIAL_RE.match(first_user_msg.strip()):
         return "trivial"
 
     # Score each task type by keyword matches, double-weighting the first message

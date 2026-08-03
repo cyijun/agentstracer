@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -277,6 +277,48 @@ class TestExportToJsonl:
         assert meta["sessions"] == 0
         assert meta["skipped"] == 1
 
+    def test_failure_preserves_previous_export(self, tmp_path, mock_anonymizer, monkeypatch):
+        output = tmp_path / "out.jsonl"
+        output.write_text("previous-success\n")
+
+        def broken_sessions(*args, **kwargs):
+            yield {
+                "session_id": "s1", "model": "model",
+                "messages": [{"role": "user", "content": "new"}], "stats": {},
+            }
+            raise RuntimeError("parser failed")
+
+        monkeypatch.setattr("agentstracer.cli.parse_project_sessions", broken_sessions)
+        with pytest.raises(RuntimeError, match="parser failed"):
+            export_to_jsonl(
+                [{"dir_name": "test", "display_name": "test"}],
+                output,
+                mock_anonymizer,
+            )
+        assert output.read_text() == "previous-success\n"
+        assert not list(tmp_path.glob(".out.jsonl.*.tmp"))
+
+    def test_atomic_export_is_private_and_honors_user_allowlist(
+        self, tmp_path, mock_anonymizer, monkeypatch,
+    ):
+        output = tmp_path / "out.jsonl"
+        token = "ghp_AbCdEf0123456789XYZ"
+        monkeypatch.setattr(
+            "agentstracer.cli.parse_project_sessions",
+            lambda *args, **kwargs: [{
+                "session_id": "s1", "model": "model",
+                "messages": [{"role": "user", "content": token}], "stats": {},
+            }],
+        )
+        export_to_jsonl(
+            [{"dir_name": "test", "display_name": "test"}],
+            output,
+            mock_anonymizer,
+            user_allowlist=[{"type": "exact", "text": token}],
+        )
+        assert token in output.read_text()
+        assert output.stat().st_mode & 0o777 == 0o600
+
 
 # --- configure ---
 
@@ -299,6 +341,41 @@ class TestConfigure:
 
         configure(source="codex")
         assert saved["source"] == "codex"
+
+    def test_can_reenable_secret_redaction(self, monkeypatch):
+        monkeypatch.setattr(
+            "agentstracer.cli.load_config",
+            lambda: {"no_secrets_redaction": True},
+        )
+        saved = {}
+        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
+        configure(no_secrets_redaction=False)
+        assert saved["no_secrets_redaction"] is False
+
+    def test_can_clear_excluded_projects(self, monkeypatch):
+        monkeypatch.setattr(
+            "agentstracer.cli.load_config",
+            lambda: {"excluded_projects": ["a", "b"]},
+        )
+        saved = {}
+        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
+        configure(clear_excludes=True)
+        assert saved["excluded_projects"] == []
+
+    def test_cli_reversible_privacy_flags(self, monkeypatch, capsys):
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {
+            "excluded_projects": ["old"], "no_secrets_redaction": True,
+        })
+        saved = {}
+        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
+        monkeypatch.setattr("sys.argv", [
+            "agentstracer", "config", "--clear-excludes", "--secrets-redaction",
+        ])
+        main()
+        assert saved["excluded_projects"] == []
+        assert saved["no_secrets_redaction"] is False
+        assert saved["projects_confirmed"] is True
+        capsys.readouterr()
 
 
 # --- list_projects ---
@@ -418,8 +495,9 @@ class TestWorkflowGateMessages:
     def test_confirm_skip_full_name_scan_succeeds(self, tmp_path, monkeypatch, capsys):
         export_file = tmp_path / "export.jsonl"
         export_file.write_text('{"project":"p","model":"m","messages":[]}\n')
-        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {})
-        monkeypatch.setattr("agentstracer.cli.save_config", lambda _c: None)
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {"last_export": None})
+        saved = {}
+        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
         monkeypatch.setattr(
             "sys.argv",
             [
@@ -440,6 +518,42 @@ class TestWorkflowGateMessages:
         payload = self._extract_json(capsys.readouterr().out)
         assert payload["stage"] == "confirmed"
         assert payload["full_name_scan"]["skipped"] is True
+        persisted = json.dumps(saved)
+        assert "User declined to share full name" not in persisted
+        assert saved["last_confirm"]["status"] == "confirmed"
+
+    def test_confirm_with_name_match_remains_blocked_and_persists_receipts_only(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        export_file = tmp_path / "export.jsonl"
+        export_file.write_text(
+            '{"project":"p","model":"m","messages":[{"content":"Jane Doe"}]}\n'
+        )
+        saved = {}
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {})
+        monkeypatch.setattr("agentstracer.cli.save_config", lambda c: saved.update(c))
+        monkeypatch.setattr("sys.argv", [
+            "agentstracer", "confirm", "--file", str(export_file),
+            "--full-name", "Jane Doe",
+            "--attest-full-name",
+            "I asked Jane Doe for their full name and scanned the export for Jane Doe.",
+            "--attest-sensitive",
+            "I asked about company/client/internal names and private URLs; none found.",
+            "--attest-manual-scan",
+            "I performed a manual scan and reviewed 20 sessions across beginning, middle, and end.",
+        ])
+        main()
+        output = capsys.readouterr().out
+        payload = self._extract_json(output)
+        assert payload["stage"] == "review"
+        assert payload["full_name_scan"]["match_count"] == 1
+        assert payload["next_command"] == "agentstracer export"
+        assert "Jane Doe" not in output
+        persisted = json.dumps(saved)
+        assert "Jane Doe" not in persisted
+        assert "I asked" not in persisted
+        assert saved["stage"] == "review"
+        assert saved["last_confirm"]["status"] == "blocked"
 
     def test_export_requires_project_confirmation_with_full_flow(self, monkeypatch, capsys):
         monkeypatch.setattr("agentstracer.cli._has_session_sources", lambda _src: True)
@@ -500,6 +614,19 @@ class TestWorkflowGateMessages:
         assert any("--skip-full-name-scan" in step for step in steps)
 
 
+@pytest.mark.parametrize("argv", [
+    ["agentstracer", "--source", "codex", "--all-projects", "export"],
+    ["agentstracer", "export", "--source", "codex", "--all-projects"],
+])
+def test_export_options_work_before_or_after_subcommand(argv, monkeypatch):
+    captured = {}
+    monkeypatch.setattr("agentstracer.cli._run_export", lambda args: captured.update(vars(args)))
+    monkeypatch.setattr("sys.argv", argv)
+    main()
+    assert captured["source"] == "codex"
+    assert captured["all_projects"] is True
+
+
 # --- _scan_high_entropy_strings ---
 
 
@@ -528,7 +655,7 @@ class TestScanHighEntropyStrings:
         assert not any("550e8400" in r["match"] for r in results)
 
     def test_filters_hex_hash(self):
-        content = f"commit=abcdef1234567890abcdef1234567890abcdef12 done"
+        content = "commit=abcdef1234567890abcdef1234567890abcdef12 done"
         results = _scan_high_entropy_strings(content)
         assert not any("abcdef1234567890" in r["match"] for r in results)
 
@@ -633,6 +760,13 @@ class TestScanPiiHighEntropy:
         f.write_text('{"message": "nothing suspicious here at all"}\n')
         results = _scan_pii(f)
         assert "high_entropy_strings" not in results
+
+    def test_api_key_scan_returns_complete_match(self, tmp_path):
+        key = "ghp_AbCdEf0123456789XYZ"
+        f = tmp_path / "export.jsonl"
+        f.write_text(json.dumps({"message": key}) + "\n")
+        results = _scan_pii(f)
+        assert results["api_keys"] == [key]
 
 
 # --- Bundle CLI commands ---
@@ -817,6 +951,82 @@ class TestBundleExport:
         assert "MySecretName" not in content, "Custom redact_string was not redacted"
         assert "sk-ant-api03" not in content, "API key was not redacted"
 
+    def test_export_forwards_complete_redaction_config(
+        self, bundle_index, tmp_path, monkeypatch, capsys,
+    ):
+        from agentstracer.index import create_bundle, open_index
+
+        conn = open_index()
+        bundle_id = create_bundle(conn, ["sess-0"])
+        conn.close()
+        captured = {}
+
+        def fake_export(conn, bundle_id, bundle, **kwargs):
+            captured.update(kwargs)
+            return tmp_path, {"sessions": [], "export_path": str(tmp_path)}
+
+        monkeypatch.setattr("agentstracer.index.export_bundle_to_disk", fake_export)
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {
+            "redact_strings": ["client"],
+            "redact_usernames": ["alice"],
+            "allowlist_entries": [{"type": "category", "match_type": "email"}],
+        })
+        from agentstracer.cli import _run_bundle_export
+        _run_bundle_export(MagicMock(
+            bundle_id=bundle_id, output=None, training_format=False, json=True,
+        ))
+        assert captured["custom_strings"] == ["client"]
+        assert captured["extra_usernames"] == ["alice"]
+        assert captured["user_allowlist"] == [
+            {"type": "category", "match_type": "email"}
+        ]
+        capsys.readouterr()
+
+
+class TestCardRedaction:
+    def test_card_uses_custom_strings_usernames_and_allowlist_config(
+        self, bundle_index, monkeypatch, capsys,
+    ):
+        from agentstracer.index import open_index, upsert_sessions
+
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "card-private",
+            "project": "alice-SecretClient",
+            "display_title": "alice SecretClient",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "alice SecretClient sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAA"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "stats": {},
+        }])
+        conn.close()
+
+        captured = {}
+        monkeypatch.setattr("agentstracer.cli.load_config", lambda: {
+            "redact_strings": ["SecretClient"],
+            "redact_usernames": ["alice"],
+            "allowlist_entries": [],
+            "no_secrets_redaction": True,
+        })
+        def fake_generate_card(session, depth):
+            captured["session"] = session
+            return {"card_text": "ok"}
+
+        monkeypatch.setattr(
+            "agentstracer.card.generate_card",
+            fake_generate_card,
+        )
+        from agentstracer.cli import _run_card
+        _run_card(MagicMock(session_ids=["card-private"], depth="full", json=False))
+        encoded = json.dumps(captured["session"])
+        assert "SecretClient" not in encoded
+        assert "alice" not in encoded.lower()
+        assert "sk-ant-api03" not in encoded
+        capsys.readouterr()
+
 
 class TestSearch:
     def test_search_json(self, bundle_index, capsys):
@@ -863,26 +1073,15 @@ class TestShareHelpers:
 
 
 class TestShare:
-    def test_share_approved(self, bundle_index, capsys, monkeypatch):
-        """share --status approved creates bundle + exports + shares."""
+    def test_share_upload_is_explicitly_disabled(self, bundle_index, capsys):
         from agentstracer.cli import _run_share
-
-        def mock_share_bundle(conn, bundle_id, *, force=False, custom_strings=None):
-            return {"ok": True, "session_count": 3, "bundle_hash": "abc123",
-                    "shared_at": "2026-01-01",
-                    "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}}}
-
-        # _run_share imports share_bundle from agentstracer.daemon at call time
-        monkeypatch.setattr("agentstracer.daemon.share_bundle", mock_share_bundle)
 
         args = MagicMock(session_ids=[], status="approved", note="test",
                          force=False, json=False, preview=False)
-        _run_share(args)
-        out = capsys.readouterr().out
-        assert "Shared 3 sessions" in out
-        assert "uploaded successfully" in out
-        assert "Privacy:" in out
-        assert "2 redactions applied" in out
+        with pytest.raises(SystemExit) as excinfo:
+            _run_share(args)
+        assert excinfo.value.code == 2
+        assert "unavailable" in capsys.readouterr().err
 
     def test_share_preview(self, bundle_index, capsys):
         """share --preview shows session list without uploading."""
@@ -946,7 +1145,7 @@ class TestPiiCli:
         }
         input_file.write_text(json.dumps(session) + "\n")
 
-        monkeypatch.setattr("agentstracer.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [
+        monkeypatch.setattr("agentstracer.cli.review_session_pii", lambda session: [
             {
                 "session_id": "s1",
                 "message_index": 0,
@@ -981,6 +1180,10 @@ class TestPiiCli:
                 "source": "rule",
             },
         ])
+        monkeypatch.setattr(
+            "agentstracer.cli.review_session_pii_with_agent",
+            lambda session, **kw: [],
+        )
         monkeypatch.setattr("sys.argv", [
             "agentstracer", "pii-review",
             "--file", str(input_file),
@@ -1058,7 +1261,7 @@ class TestPiiCli:
         input_file = tmp_path / "input.jsonl"
         findings_file = tmp_path / "findings.json"
         input_file.write_text(json.dumps({"session_id": "s1", "messages": [{"content": '{"name":"Kai D"}'}]}) + "\n")
-        monkeypatch.setattr("agentstracer.cli.review_session_pii_hybrid", lambda session, ignore_llm_errors=True, **kw: [{
+        monkeypatch.setattr("agentstracer.cli.review_session_pii", lambda session: [{
             "session_id": "s1",
             "message_index": 0,
             "field": "content",
@@ -1069,6 +1272,10 @@ class TestPiiCli:
             "replacement": "[REDACTED_PERSON]",
             "source": "rule",
         }])
+        monkeypatch.setattr(
+            "agentstracer.cli.review_session_pii_with_agent",
+            lambda session, **kw: (_ for _ in ()).throw(RuntimeError("AI unavailable")),
+        )
         monkeypatch.setattr("sys.argv", [
             "agentstracer", "pii-review",
             "--file", str(input_file),
@@ -1156,3 +1363,44 @@ class TestPiiCli:
         stderr = capsys.readouterr().err
         assert "[1/2]" in stderr
         assert "[2/2]" in stderr
+
+    def test_hybrid_rules_cover_all_sessions_while_ai_is_capped(self, monkeypatch):
+        from agentstracer.cli import _collect_pii_findings
+
+        sessions = [
+            {"session_id": f"s{i}", "messages": [{"content": f"value-{i}"}]}
+            for i in range(12)
+        ]
+        ai_calls = []
+
+        def rule_review(session):
+            sid = session["session_id"]
+            return [{
+                "session_id": sid, "message_index": 0, "field": "content",
+                "entity_text": f"rule-{sid}", "entity_type": "custom_sensitive",
+                "confidence": 1.0, "replacement": "[REDACTED]", "source": "rule",
+            }]
+
+        def ai_review(session, **kwargs):
+            sid = session["session_id"]
+            ai_calls.append(sid)
+            return [{
+                "session_id": sid, "message_index": 0, "field": "content",
+                "entity_text": f"ai-{sid}", "entity_type": "custom_sensitive",
+                "confidence": 1.0, "replacement": "[REDACTED]", "source": "ai",
+            }]
+
+        monkeypatch.setattr("agentstracer.cli.review_session_pii", rule_review)
+        monkeypatch.setattr("agentstracer.cli.review_session_pii_with_agent", ai_review)
+        findings = _collect_pii_findings(sessions, "hybrid")
+        rule_sessions = {
+            finding["session_id"] for finding in findings if finding["source"] == "rule"
+        }
+        assert rule_sessions == {f"s{i}" for i in range(12)}
+        assert len(ai_calls) == 10
+
+    @pytest.mark.parametrize("provider", ["ai", "claude", "hybrid"])
+    def test_empty_ai_review_returns_without_executor(self, provider):
+        from agentstracer.cli import _collect_pii_findings
+
+        assert _collect_pii_findings([], provider) == []

@@ -330,6 +330,31 @@ def _split_session(
         }
         children.append(child)
 
+    # Legacy parsed sessions only stored token totals on the parent. Allocate
+    # any unassigned remainder proportionally so splitting never silently
+    # turns a known total into zero.
+    parent_stats = session.get("stats", {})
+    if children and isinstance(parent_stats, dict):
+        weights = [
+            child["stats"]["assistant_messages"] or len(child["messages"])
+            for child in children
+        ]
+        total_weight = sum(weights) or len(children)
+        for field in ("input_tokens", "output_tokens"):
+            try:
+                parent_total = max(int(parent_stats.get(field, 0) or 0), 0)
+            except (TypeError, ValueError, OverflowError):
+                parent_total = 0
+            observed = sum(child["stats"][field] for child in children)
+            remainder = max(parent_total - observed, 0)
+            if not remainder:
+                continue
+            allocations = [remainder * weight // total_weight for weight in weights]
+            for idx in range(remainder - sum(allocations)):
+                allocations[idx % len(allocations)] += 1
+            for child, allocation in zip(children, allocations):
+                child["stats"][field] += allocation
+
     return children
 
 
@@ -362,7 +387,10 @@ def segment_openclaw_session(
     # Step 1: Collect candidate boundaries from all signals
     boundary_sets: dict[str, list[int]] = {
         "time_gap": _detect_time_gaps(messages, threshold_minutes),
-        "compaction": _detect_compaction_boundaries(messages),
+        "compaction": _detect_compaction_boundaries(messages) + [
+            int(index) for index in (hints or {}).get("compaction_indices", [])
+            if isinstance(index, (int, float)) and 0 < int(index) < len(messages)
+        ],
         "tool_mode": _detect_tool_mode_shifts(messages),
         "workspace": _detect_workspace_switches(messages),
     }
@@ -416,14 +444,15 @@ def _parse_ts(ts: Any) -> datetime | None:
         return None
     if isinstance(ts, (int, float)):
         try:
-            return datetime.fromtimestamp(ts / 1000 if ts > 1e12 else ts, tz=timezone.utc)
+            return datetime.fromtimestamp(ts / 1000 if ts >= 1e12 else ts, tz=timezone.utc)
         except (ValueError, OSError, OverflowError):
             return None
     if isinstance(ts, str):
         # Handle Z suffix (fromisoformat on Python 3.10 doesn't support Z)
         normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
         try:
-            return datetime.fromisoformat(normalized)
+            parsed = datetime.fromisoformat(normalized)
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
         except ValueError:
             pass
     return None
@@ -518,6 +547,22 @@ def _compute_stats(messages: list[dict]) -> dict[str, int]:
         elif role == "assistant":
             stats["assistant_messages"] += 1
             stats["tool_uses"] += len(msg.get("tool_uses", []))
+            usage = msg.get("usage", {})
+            if isinstance(usage, dict):
+                def safe_int(value: Any) -> int:
+                    try:
+                        return max(int(value or 0), 0)
+                    except (TypeError, ValueError, OverflowError):
+                        return 0
+
+                stats["input_tokens"] += (
+                    safe_int(usage.get("input_tokens", usage.get("input")))
+                    + safe_int(usage.get("cache_read_input_tokens", usage.get("cache_read")))
+                    + safe_int(usage.get("cache_creation_input_tokens", usage.get("cache_write")))
+                )
+                stats["output_tokens"] += safe_int(
+                    usage.get("output_tokens", usage.get("output")),
+                )
     return stats
 
 

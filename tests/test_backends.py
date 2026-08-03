@@ -52,6 +52,14 @@ class TestDetection:
     def test_classify_process_command_unknown(self):
         assert _classify_process_command("bash", "/bin/bash") is None
 
+    def test_backend_name_in_argument_or_filename_is_not_misclassified(self):
+        assert _classify_process_command(
+            "bash", "/bin/bash /tmp/codex-helper.py --mode claude",
+        ) is None
+
+    def test_interpreter_wrapped_backend_uses_exact_script_name(self):
+        assert _classify_process_command("node", "/usr/bin/node /opt/bin/codex") == "codex"
+
 
 class TestResolveBackend:
     def test_explicit_backend(self):
@@ -110,12 +118,16 @@ class TestCheckBackendRuntime:
 class TestRequireBackendCommand:
     def test_found(self, monkeypatch):
         monkeypatch.setattr("agentstracer.backends.shutil.which", lambda cmd: "/usr/bin/" + cmd)
-        assert require_backend_command("claude") == "claude"
+        assert require_backend_command("claude") == "/usr/bin/claude"
 
     def test_missing_raises(self, monkeypatch):
         monkeypatch.setattr("agentstracer.backends.shutil.which", lambda cmd: None)
         with pytest.raises(RuntimeError, match="CLI not found"):
             require_backend_command("codex")
+
+    def test_unsupported_backend_raises_runtime_error(self):
+        with pytest.raises(RuntimeError, match="Unsupported backend"):
+            require_backend_command("gemini")
 
 
 class TestResolveBackendAutoNoAgent:

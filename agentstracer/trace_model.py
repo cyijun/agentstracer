@@ -13,7 +13,9 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -46,18 +48,44 @@ def stable_hex(*parts: Any, nbytes: int) -> str:
     return value.hex()
 
 
-def _numeric_timestamp_to_ns(value: float) -> int | None:
-    if not math.isfinite(value) or value <= 0:
+def _numeric_timestamp_to_ns(value: int | float | Decimal) -> int | None:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        exact = value if isinstance(value, Decimal) else Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not exact.is_finite() or exact <= 0:
         return None
     # Current agent logs use a mix of seconds, milliseconds, microseconds and
     # nanoseconds.  Magnitude is unambiguous for contemporary timestamps.
-    if value >= 1e17:
-        return int(value)
-    if value >= 1e14:
-        return int(value * 1_000)
-    if value >= 1e11:
-        return int(value * 1_000_000)
-    return int(value * 1_000_000_000)
+    if exact >= Decimal("1e17"):
+        multiplier = 1
+    elif exact >= Decimal("1e14"):
+        multiplier = 1_000
+    elif exact >= Decimal("1e11"):
+        multiplier = 1_000_000
+    else:
+        multiplier = 1_000_000_000
+    return int(exact * multiplier)
+
+
+def _datetime_to_ns(value: datetime) -> int:
+    """Convert a datetime without going through a precision-losing float."""
+    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    utc = aware.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = utc - epoch
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(?P<base>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d+))?(?P<tz>Z|[+-]\d{2}:?\d{2})?$"
+)
 
 
 def timestamp_ns(value: Any) -> int | None:
@@ -65,32 +93,50 @@ def timestamp_ns(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
-        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1_000_000_000)
-    if isinstance(value, (int, float)):
-        return _numeric_timestamp_to_ns(float(value))
+        return _datetime_to_ns(value)
+    if isinstance(value, int):
+        return _numeric_timestamp_to_ns(value)
+    if isinstance(value, float):
+        return _numeric_timestamp_to_ns(value)
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text:
         return None
     try:
-        return _numeric_timestamp_to_ns(float(text))
-    except ValueError:
+        return _numeric_timestamp_to_ns(Decimal(text))
+    except InvalidOperation:
         pass
+    match = _ISO_TIMESTAMP_RE.fullmatch(text)
+    if match:
+        timezone_text = match.group("tz") or "+00:00"
+        if timezone_text == "Z":
+            timezone_text = "+00:00"
+        elif len(timezone_text) == 5:
+            timezone_text = timezone_text[:3] + ":" + timezone_text[3:]
+        try:
+            seconds = datetime.fromisoformat(match.group("base") + timezone_text)
+        except ValueError:
+            return None
+        fraction = (match.group("fraction") or "")[:9].ljust(9, "0")
+        return _datetime_to_ns(seconds) + int(fraction or "0")
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1_000_000_000)
+    return _datetime_to_ns(dt)
 
 
 def ns_to_iso(value: int | None) -> str | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(value / 1_000_000_000, tz=timezone.utc).isoformat()
+    seconds, nanoseconds = divmod(value, 1_000_000_000)
+    base = datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+    if not nanoseconds:
+        return base
+    return base.replace("+00:00", f".{nanoseconds:09d}+00:00")
 
 
 def file_mtime_ns(path: Path) -> int | None:
@@ -102,7 +148,7 @@ def file_mtime_ns(path: Path) -> int | None:
 
 def _json_default(value: Any) -> Any:
     if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
+        return dataclasses.asdict(value)  # type: ignore[arg-type]
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, datetime):
@@ -213,10 +259,22 @@ class AgentTrace:
             observation.links = valid_links
 
         self._check_parent_cycles()
+        if self.session_id is None:
+            self.session_id = stable_hex(
+                "agentstracer-session", self.source, self.source_session_id,
+                nbytes=16,
+            )
+        self.tags = list(dict.fromkeys([self.source, "agentstracer", *self.tags]))
         fingerprint_payload = {
             "logical_id": self.logical_id,
+            "name": self.name,
             "source": self.source,
             "source_session_id": self.source_session_id,
+            "session_id": self.session_id,
+            "project": self.project,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "environment": self.environment,
             "observations": [dataclasses.asdict(o) for o in self.observations],
         }
         self.content_hash = hashlib.sha256(
@@ -228,12 +286,6 @@ class AgentTrace:
             "agentstracer-trace", self.source, self.logical_id, self.content_hash,
             nbytes=16,
         )
-        if self.session_id is None:
-            self.session_id = stable_hex(
-                "agentstracer-session", self.source, self.source_session_id,
-                nbytes=16,
-            )
-        self.tags = list(dict.fromkeys([self.source, "agentstracer", *self.tags]))
         return self
 
     def _check_parent_cycles(self) -> None:
@@ -313,16 +365,35 @@ def sanitize_value(
             redact_secrets=redact_secrets,
         )
     if isinstance(value, dict):
-        return {
-            str(k): sanitize_value(
-                v,
+        sanitized: dict[str, Any] = {}
+        collision_counts: dict[str, int] = {}
+        for raw_key, item_value in value.items():
+            key_text = str(raw_key)
+            sanitized_key = _sanitize_string(
+                key_text,
+                key=None,
                 anonymizer=anonymizer,
                 custom_strings=custom_strings,
                 redact_secrets=redact_secrets,
-                key=str(k),
             )
-            for k, v in value.items()
-        }
+            candidate = sanitized_key
+            if candidate in sanitized:
+                suffix = collision_counts.get(sanitized_key, 1) + 1
+                candidate = f"{sanitized_key}__redacted_{suffix}"
+                while candidate in sanitized:
+                    suffix += 1
+                    candidate = f"{sanitized_key}__redacted_{suffix}"
+                collision_counts[sanitized_key] = suffix
+            else:
+                collision_counts[sanitized_key] = 1
+            sanitized[candidate] = sanitize_value(
+                item_value,
+                anonymizer=anonymizer,
+                custom_strings=custom_strings,
+                redact_secrets=redact_secrets,
+                key=key_text,
+            )
+        return sanitized
     if isinstance(value, (list, tuple, set)):
         return [
             sanitize_value(
@@ -354,6 +425,37 @@ def sanitize_trace(
 ) -> AgentTrace:
     """Sanitize a trace in place and finalize its immutable identifiers."""
     strings = tuple(custom_strings)
+    # Normalize relationships first so any repair metadata introduced by
+    # finalize() is included in the sanitization pass below.
+    trace.finalize()
+    trace.logical_id = _sanitize_string(
+        trace.logical_id, key=None, anonymizer=anonymizer,
+        custom_strings=strings, redact_secrets=redact_secrets,
+    )
+    trace.source = _sanitize_string(
+        trace.source, key=None, anonymizer=anonymizer,
+        custom_strings=strings, redact_secrets=redact_secrets,
+    )
+    trace.source_session_id = _sanitize_string(
+        trace.source_session_id, key=None, anonymizer=anonymizer,
+        custom_strings=strings, redact_secrets=redact_secrets,
+    )
+    if trace.session_id is not None:
+        trace.session_id = _sanitize_string(
+            trace.session_id, key=None, anonymizer=anonymizer,
+            custom_strings=strings, redact_secrets=redact_secrets,
+        )
+    trace.environment = _sanitize_string(
+        trace.environment, key=None, anonymizer=anonymizer,
+        custom_strings=strings, redact_secrets=redact_secrets,
+    )
+    trace.tags = [
+        _sanitize_string(
+            tag, key=None, anonymizer=anonymizer,
+            custom_strings=strings, redact_secrets=redact_secrets,
+        )
+        for tag in trace.tags
+    ]
     trace.name = _sanitize_string(
         trace.name,
         key=None,
@@ -374,7 +476,28 @@ def sanitize_trace(
         custom_strings=strings,
         redact_secrets=redact_secrets,
     )
+    identifier_map: dict[str, str] = {}
+    used_identifiers: set[str] = set()
     for observation in trace.observations:
+        raw_identifier = observation.logical_id
+        base_identifier = _sanitize_string(
+            raw_identifier, key=None, anonymizer=anonymizer,
+            custom_strings=strings, redact_secrets=redact_secrets,
+        )
+        sanitized_identifier = base_identifier
+        suffix = 2
+        while sanitized_identifier in used_identifiers:
+            sanitized_identifier = f"{base_identifier}__redacted_{suffix}"
+            suffix += 1
+        identifier_map[raw_identifier] = sanitized_identifier
+        used_identifiers.add(sanitized_identifier)
+
+    for observation in trace.observations:
+        raw_parent = observation.parent_logical_id
+        observation.logical_id = identifier_map[observation.logical_id]
+        observation.parent_logical_id = (
+            identifier_map.get(raw_parent, raw_parent) if raw_parent is not None else None
+        )
         observation.name = _sanitize_string(
             observation.name,
             key=None,
@@ -405,6 +528,9 @@ def sanitize_trace(
                 redact_secrets=redact_secrets,
             )
         for link in observation.links:
+            link.target_logical_id = identifier_map.get(
+                link.target_logical_id, link.target_logical_id
+            )
             link.attributes = sanitize_value(
                 link.attributes,
                 anonymizer=anonymizer,
@@ -418,5 +544,5 @@ def bounds(values: Iterable[int | None], fallback: int | None = None) -> tuple[i
     present = [value for value in values if value is not None]
     if present:
         return min(present), max(present)
-    now = fallback or int(datetime.now(tz=timezone.utc).timestamp() * 1_000_000_000)
+    now = fallback or _datetime_to_ns(datetime.now(tz=timezone.utc))
     return now, now

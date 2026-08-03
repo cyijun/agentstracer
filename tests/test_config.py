@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from agentstracer.config import load_config, save_config
 
 
@@ -31,6 +29,33 @@ class TestLoadConfig:
         captured = capsys.readouterr()
         assert "Warning" in captured.err
 
+    def test_non_object_json_returns_defaults(self, tmp_config, capsys):
+        tmp_config.parent.mkdir(parents=True, exist_ok=True)
+        tmp_config.write_text("[]")
+        config = load_config()
+        assert config["repo"] is None
+        assert config["redact_strings"] == []
+        assert "Warning" in capsys.readouterr().err
+
+    def test_invalid_known_field_types_are_ignored(self, tmp_config, capsys):
+        tmp_config.parent.mkdir(parents=True, exist_ok=True)
+        tmp_config.write_text(json.dumps({
+            "redact_strings": "not-a-list",
+            "no_secrets_redaction": 1,
+            "custom_key": {"kept": True},
+        }))
+        config = load_config()
+        assert config["redact_strings"] == []
+        assert config["no_secrets_redaction"] is False
+        assert config["custom_key"] == {"kept": True}
+        assert "redact_strings" in capsys.readouterr().err
+
+    def test_default_mutable_values_are_isolated_between_loads(self, tmp_config):
+        first = load_config()
+        first["excluded_projects"].append("private")
+        second = load_config()
+        assert second["excluded_projects"] == []
+
     def test_extra_keys_preserved(self, tmp_config):
         tmp_config.parent.mkdir(parents=True, exist_ok=True)
         tmp_config.write_text(json.dumps({"repo": None, "my_extra": [1, 2, 3]}))
@@ -52,6 +77,11 @@ class TestSaveConfig:
         data = json.loads(tmp_config.read_text())
         assert data["repo"] == "new"
 
+    def test_uses_private_directory_and_file_permissions(self, tmp_config):
+        save_config({"repo": "alice/data"})
+        assert tmp_config.parent.stat().st_mode & 0o777 == 0o700
+        assert tmp_config.stat().st_mode & 0o777 == 0o600
+
     def test_oserror_prints_warning(self, tmp_config, monkeypatch, capsys):
         # Make the directory unwritable
         monkeypatch.setattr(
@@ -59,13 +89,10 @@ class TestSaveConfig:
             tmp_config.parent / "nonexistent" / "deep" / "dir",
         )
         # Actually mock mkdir to raise
-        import agentstracer.config as config_mod
-        original_mkdir = type(tmp_config.parent).mkdir
-
         def failing_mkdir(self, *a, **kw):
             raise OSError("Permission denied")
 
         monkeypatch.setattr(type(tmp_config.parent), "mkdir", failing_mkdir)
-        save_config({"repo": "test"})
+        assert save_config({"repo": "test"}) is False
         captured = capsys.readouterr()
         assert "Warning" in captured.err

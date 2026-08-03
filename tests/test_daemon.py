@@ -1,13 +1,15 @@
 """Tests for the workbench daemon HTTP API."""
 
 import json
+import io
+import zipfile
 from http.client import HTTPConnection
 from threading import Thread
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from agentstracer.daemon import WorkbenchHandler, run_server
+from agentstracer.daemon import Scanner, WorkbenchHandler, run_server
 from agentstracer.index import open_index, upsert_sessions
 
 
@@ -65,6 +67,14 @@ def _get(port, path):
     return resp.status, json.loads(body) if resp.getheader("Content-Type", "").startswith("application/json") else body
 
 
+def _request_raw(port, method, path, body=None, headers=None):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    payload = resp.read()
+    return resp.status, dict(resp.getheaders()), payload
+
+
 def _post(port, path, data=None):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(data or {}).encode()
@@ -104,6 +114,56 @@ class TestSessionsAPI:
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
 
+    def test_rejects_cross_origin_browser_request(self, server):
+        status, _, payload = _request_raw(
+            server, "GET", "/api/sessions", headers={"Origin": "https://evil.example"},
+        )
+        assert status == 403
+        assert b"Cross-origin" in payload
+
+    def test_rejects_dns_rebinding_host(self, server):
+        status, _, payload = _request_raw(
+            server, "GET", "/api/sessions", headers={"Host": "evil.example"},
+        )
+        assert status == 403
+        assert b"Loopback" in payload
+
+    def test_accepts_exact_loopback_origin_without_wildcard_cors(self, server):
+        status, headers, _ = _request_raw(
+            server, "GET", "/api/sessions",
+            headers={"Origin": f"http://127.0.0.1:{server}"},
+        )
+        assert status == 200
+        assert "Access-Control-Allow-Origin" not in headers
+
+    @pytest.mark.parametrize("path", [
+        "/api/sessions?limit=-1", "/api/sessions?limit=nope", "/api/search?q=x&offset=-1",
+    ])
+    def test_invalid_pagination_returns_json_400(self, server, path):
+        status, data = _get(server, path)
+        assert status == 400
+        assert "error" in data
+
+    def test_rejects_non_object_json(self, server):
+        status, _, payload = _request_raw(
+            server, "POST", "/api/scan", body=b"[]",
+            headers={"Content-Type": "application/json"},
+        )
+        assert status == 400
+        assert b"must be an object" in payload
+
+    def test_rejects_non_json_content_type(self, server):
+        status, _, _ = _request_raw(
+            server, "POST", "/api/scan", body=b"{}",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert status == 415
+
+    def test_invalid_score_returns_json_400(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"ai_quality_score": "bad"})
+        assert status == 400
+        assert "error" in data
+
 
 class TestStatsAPI:
     def test_stats(self, server):
@@ -139,6 +199,48 @@ class TestBundlesAPI:
         status, data = _post(server, "/api/bundles", {"session_ids": []})
         assert status == 400
 
+    def test_create_rejects_string_instead_of_id_list(self, server):
+        status, _ = _post(server, "/api/bundles", {"session_ids": "sess-0"})
+        assert status == 400
+
+    def test_download_uses_redacted_export_pipeline(self, server):
+        from agentstracer.index import create_bundle, open_index, upsert_sessions
+
+        token = "ghp_AbCdEf0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        custom = "InternalProjectZephyr"
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "secret-session", "project": "project", "source": "claude",
+            "messages": [{
+                "role": "user", "content": f"use {token}",
+                "tool_uses": [{
+                    "tool": "bash", "input": {"command": f"deploy {custom} --token {token}"},
+                    "output": "ok", "status": "success",
+                }],
+            }],
+            "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 1},
+        }])
+        bundle_id = create_bundle(
+            conn, ["secret-session"], attestation=f"approved with {token} for {custom}",
+        )
+        conn.close()
+
+        with patch("agentstracer.daemon.load_config", return_value={
+            "redact_strings": [custom], "allowlist_entries": [], "redact_usernames": [],
+        }):
+            status, headers, payload = _request_raw(
+                server, "GET", f"/api/bundles/{bundle_id}/download",
+            )
+        assert status == 200
+        assert "hostname" not in headers.get("Content-Disposition", "")
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            exported = archive.read("sessions.jsonl").decode()
+            manifest = archive.read("manifest.json").decode()
+        assert token not in exported
+        assert custom not in exported
+        assert token not in manifest
+        assert custom not in manifest
+
 
 class TestPoliciesAPI:
     def test_add_and_list(self, server):
@@ -171,8 +273,6 @@ class TestStaticServing:
 class TestRunServerPortFallback:
     def test_fallback_to_free_port_on_oserror(self, index_setup):
         """If the default port is busy, run_server falls back without opening a browser."""
-        from http.server import ThreadingHTTPServer
-
         real_server = MagicMock()
         real_server.server_address = ("127.0.0.1", 9999)
         real_server.serve_forever.side_effect = KeyboardInterrupt
@@ -192,6 +292,23 @@ class TestRunServerPortFallback:
             run_server(port=8384, open_browser=True)
 
         mock_open.assert_not_called()
+
+
+class TestScanner:
+    def test_unchanged_project_is_not_reparsed(self):
+        scanner = Scanner()
+        project = {
+            "source": "claude", "dir_name": "project", "session_count": 1,
+            "total_size_bytes": 100, "latest_mtime_ns": 123,
+        }
+        connection = MagicMock()
+        with patch("agentstracer.daemon.open_index", return_value=connection), \
+             patch("agentstracer.daemon.discover_projects", return_value=[project]), \
+             patch("agentstracer.daemon.parse_project_sessions", return_value=[{"session_id": "x"}]) as parse, \
+             patch("agentstracer.daemon.upsert_sessions", return_value=1):
+            assert scanner.scan_once() == {"claude": 1}
+            assert scanner.scan_once() == {}
+        assert parse.call_count == 1
 
 
 class TestShareAPI:

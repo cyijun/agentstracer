@@ -3,8 +3,6 @@
 import json
 import tempfile
 
-import pytest
-
 from agentstracer.segmenter import (
     _build_exchanges,
     _classify_tool_mode,
@@ -377,6 +375,27 @@ class TestSplitSession:
         assert len(result) == 1
         assert result[0] is session
 
+    def test_preserves_message_level_token_usage(self):
+        msgs = [
+            _user("a"),
+            _msg("assistant", "b", usage={"input_tokens": 10, "cache_read_input_tokens": 2, "output_tokens": 3}),
+            _user("c"),
+            _msg("assistant", "d", usage={"input_tokens": 20, "output_tokens": 7}),
+        ]
+        session = _session(msgs)
+        session["stats"].update(input_tokens=32, output_tokens=10)
+        children = _split_session(session, [2])
+        assert [child["stats"]["input_tokens"] for child in children] == [12, 20]
+        assert [child["stats"]["output_tokens"] for child in children] == [3, 7]
+
+    def test_allocates_legacy_parent_tokens_without_losing_totals(self):
+        msgs = [_user("a"), _assistant("b"), _user("c"), _assistant("d")]
+        session = _session(msgs)
+        session["stats"].update(input_tokens=101, output_tokens=51)
+        children = _split_session(session, [2])
+        assert sum(child["stats"]["input_tokens"] for child in children) == 101
+        assert sum(child["stats"]["output_tokens"] for child in children) == 51
+
 
 # ---------------------------------------------------------------------------
 # Full segmentation pipeline
@@ -583,6 +602,18 @@ class TestHelpers:
     def test_parse_ts_epoch_ms(self):
         dt = _parse_ts(1711004400000)  # epoch ms
         assert dt is not None
+
+    def test_parse_ts_naive_is_normalized_to_utc(self):
+        dt = _parse_ts("2026-03-21T09:00:00")
+        assert dt is not None
+        assert dt.tzinfo is not None
+
+    def test_time_gap_handles_mixed_naive_and_aware_timestamps(self):
+        msgs = [
+            _user("a", "2026-03-21T09:00:00"),
+            _user("b", "2026-03-21T10:00:00Z"),
+        ]
+        assert _detect_time_gaps(msgs, threshold_minutes=30) == [1]
 
     def test_parse_ts_none(self):
         assert _parse_ts(None) is None

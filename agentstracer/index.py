@@ -1,9 +1,11 @@
 """Local SQLite + FTS5 index for the scientist workbench."""
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     reviewer_notes     TEXT,
     reviewed_at        TEXT,
     blob_path          TEXT,
+    content_hash       TEXT,
     raw_source_path    TEXT,
     indexed_at         TEXT NOT NULL,
     updated_at         TEXT,
@@ -107,8 +110,8 @@ def open_index() -> sqlite3.Connection:
     if they do not already exist. Returns a connection with
     row_factory set to sqlite3.Row for dict-like access.
     """
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    BLOBS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(CONFIG_DIR)
+    _ensure_private_dir(BLOBS_DIR)
 
     conn = sqlite3.connect(str(INDEX_DB), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -145,6 +148,7 @@ def open_index() -> sqlite3.Connection:
         ("segment_start_message", "INTEGER"),
         ("segment_end_message", "INTEGER"),
         ("segment_reason", "TEXT"),
+        ("content_hash", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -165,14 +169,45 @@ def open_index() -> sqlite3.Connection:
             if "duplicate column" not in str(e):
                 raise
 
+    _ensure_private_file(INDEX_DB)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{INDEX_DB}{suffix}")
+        if sidecar.exists():
+            _ensure_private_file(sidecar)
     return conn
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create a sensitive-data directory and repair permissive modes."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _ensure_private_file(path: Path) -> None:
+    """Best-effort repair for files containing raw local conversations."""
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _flatten_transcript(session: dict[str, Any]) -> str:
     """Extract all message content and tool I/O as plain text for FTS indexing."""
     parts: list[str] = []
+    def append_value(value: Any) -> None:
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                append_value(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                append_value(nested)
+
     for msg in session.get("messages", []):
-        role = msg.get("role", "")
         content = msg.get("content")
         if isinstance(content, str):
             parts.append(content)
@@ -187,16 +222,11 @@ def _flatten_transcript(session: dict[str, Any]) -> str:
                         parts.append(text)
                     # Tool use input
                     tool_input = block.get("input")
-                    if isinstance(tool_input, dict):
-                        for v in tool_input.values():
-                            if isinstance(v, str):
-                                parts.append(v)
-                    elif isinstance(tool_input, str):
-                        parts.append(tool_input)
+                    append_value(tool_input)
                     # Tool result output
                     output = block.get("output")
-                    if isinstance(output, str):
-                        parts.append(output)
+                    append_value(output)
+        append_value(msg.get("tool_uses", []))
         # Handle agentstracer's parsed format: tool uses stored as dicts with "tool" key
         tool = msg.get("tool")
         if tool:
@@ -313,12 +343,42 @@ def _generate_display_title(session: dict[str, Any]) -> str:
     return session.get("session_id", "untitled")
 
 
-def _write_blob(session_id: str, session: dict[str, Any]) -> Path:
+def _session_content_hash(session: dict[str, Any]) -> str:
+    payload = json.dumps(
+        session, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_blob_path(session_id: str, content_hash: str) -> Path:
+    safe_id = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:32]
+    return BLOBS_DIR / f"{safe_id}-{content_hash[:16]}.json"
+
+
+def _write_blob(
+    session_id: str,
+    session: dict[str, Any],
+    content_hash: str | None = None,
+) -> Path:
     """Write full session JSON to blob storage. Returns the blob file path."""
-    BLOBS_DIR.mkdir(parents=True, exist_ok=True)
-    blob_path = BLOBS_DIR / f"{session_id}.json"
-    with open(blob_path, "w") as f:
-        json.dump(session, f, default=str)
+    _ensure_private_dir(BLOBS_DIR)
+    digest = content_hash or _session_content_hash(session)
+    blob_path = _canonical_blob_path(session_id, digest)
+    fd, tmp_name = tempfile.mkstemp(prefix=".blob-", suffix=".tmp", dir=BLOBS_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(session, f, ensure_ascii=False, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, blob_path)
+        _ensure_private_file(blob_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return blob_path
 
 
@@ -341,54 +401,50 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
     # Check FTS availability
     has_fts = _has_fts(conn)
 
-    for session in sessions:
-        session_id = session.get("session_id")
-        if not session_id:
-            continue
+    affected_bundles: set[str] = set()
+    try:
+        for session in sessions:
+            session_id = session.get("session_id")
+            if not session_id:
+                continue
 
-        project = session.get("project", "")
-        source = session.get("source", "")
-        if not project or not source:
-            continue
+            project = session.get("project", "")
+            source = session.get("source", "")
+            if not project or not source:
+                continue
 
-        stats = session.get("stats", {})
-        duration = _compute_duration(session)
+            stats = session.get("stats", {})
+            duration = _compute_duration(session)
+            badges = compute_all_badges(session)
+            display_title = badges["display_title"]
+            files = badges["files_touched"]
+            commands = badges["commands_run"]
+            content_hash = _session_content_hash(session)
 
-        # Compute badges and signals
-        badges = compute_all_badges(session)
-        display_title = badges["display_title"]
-        files = badges["files_touched"]
-        commands = badges["commands_run"]
+            existing = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,),
+            ).fetchone()
+            is_new = existing is None
+            old_hash = existing["content_hash"] if existing is not None else None
+            if existing is not None and not old_hash and existing["blob_path"]:
+                try:
+                    old_path = Path(existing["blob_path"]).resolve()
+                    if old_path.is_relative_to(BLOBS_DIR.resolve()):
+                        with old_path.open(encoding="utf-8") as old_file:
+                            old_hash = _session_content_hash(json.load(old_file))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    old_hash = None
+            content_changed = existing is not None and old_hash != content_hash
+            if content_changed and existing["bundle_id"]:
+                affected_bundles.add(existing["bundle_id"])
 
-        # Check if session already exists and capture fields we need to preserve
-        existing = conn.execute(
-            "SELECT session_id, review_status, indexed_at, ai_quality_score, ai_score_reason, bundle_id, rowid FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        is_new = existing is None
+            blob_path = _write_blob(session_id, session, content_hash)
 
-        # Write blob
-        blob_path = _write_blob(session_id, session)
+            if has_fts and not is_new:
+                conn.execute("DELETE FROM sessions_fts WHERE session_id = ?", (session_id,))
 
-        # Delete old FTS entry before replacing.
-        if has_fts and not is_new:
             conn.execute(
-                "DELETE FROM sessions_fts WHERE session_id = ?",
-                (session_id,),
-            )
-
-        # Preserve review_status, indexed_at, and bundle_id from old row
-        # before REPLACE deletes it. INSERT OR REPLACE deletes the
-        # conflicting row first, so subqueries referencing the old row in
-        # VALUES would find nothing.
-        preserved_status = existing["review_status"] if not is_new else "new"
-        preserved_indexed_at = existing["indexed_at"] if not is_new else now
-        preserved_ai_score = existing["ai_quality_score"] if not is_new else None
-        preserved_ai_reason = existing["ai_score_reason"] if not is_new else None
-        preserved_bundle_id = existing["bundle_id"] if not is_new else None
-
-        conn.execute(
-            """INSERT OR REPLACE INTO sessions (
+                """INSERT INTO sessions (
                 session_id, project, source, model,
                 start_time, end_time, duration_seconds,
                 git_branch,
@@ -398,85 +454,82 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 outcome_badge, value_badges, risk_badges,
                 sensitivity_score, task_type,
                 files_touched, commands_run,
-                blob_path,
+                blob_path, raw_source_path, content_hash,
                 indexed_at, updated_at,
-                review_status,
-                ai_quality_score, ai_score_reason,
-                bundle_id,
                 parent_session_id, segment_index,
                 segment_start_message, segment_end_message,
                 segment_reason
             ) VALUES (
-                ?, ?, ?, ?,
-                ?, ?, ?,
-                ?,
-                ?, ?, ?,
-                ?, ?,
-                ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?, ?,
-                ?
-            )""",
-            (
-                session_id, project, source, session.get("model"),
-                session.get("start_time"), session.get("end_time"), duration,
-                session.get("git_branch"),
-                stats.get("user_messages", 0),
-                stats.get("assistant_messages", 0),
-                stats.get("tool_uses", 0),
-                stats.get("input_tokens", 0),
-                stats.get("output_tokens", 0),
-                display_title,
-                badges["outcome_badge"],
-                json.dumps(badges["value_badges"]),
-                json.dumps(badges["risk_badges"]),
-                badges["sensitivity_score"],
-                badges["task_type"],
-                json.dumps(files),
-                json.dumps(commands),
-                str(blob_path),
-                preserved_indexed_at,
-                now,
-                preserved_status,
-                preserved_ai_score,
-                preserved_ai_reason,
-                preserved_bundle_id,
-                session.get("parent_session_id"),
-                session.get("segment_index"),
-                session.get("segment_message_range", [None, None])[0] if session.get("segment_message_range") else None,
-                session.get("segment_message_range", [None, None])[1] if session.get("segment_message_range") else None,
-                session.get("segment_reason"),
-            ),
-        )
-
-        # Insert FTS entry
-        if has_fts:
-            transcript = _flatten_transcript(session)
-            conn.execute(
-                "INSERT INTO sessions_fts("
-                "session_id, display_title, transcript_text, files_touched, commands_run) "
-                "VALUES(?, ?, ?, ?, ?)",
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ) ON CONFLICT(session_id) DO UPDATE SET
+                project=excluded.project, source=excluded.source, model=excluded.model,
+                start_time=excluded.start_time, end_time=excluded.end_time,
+                duration_seconds=excluded.duration_seconds, git_branch=excluded.git_branch,
+                user_messages=excluded.user_messages,
+                assistant_messages=excluded.assistant_messages,
+                tool_uses=excluded.tool_uses, input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens, display_title=excluded.display_title,
+                outcome_badge=excluded.outcome_badge, value_badges=excluded.value_badges,
+                risk_badges=excluded.risk_badges,
+                sensitivity_score=excluded.sensitivity_score, task_type=excluded.task_type,
+                files_touched=excluded.files_touched, commands_run=excluded.commands_run,
+                blob_path=excluded.blob_path, raw_source_path=excluded.raw_source_path,
+                content_hash=excluded.content_hash, updated_at=excluded.updated_at,
+                parent_session_id=excluded.parent_session_id,
+                segment_index=excluded.segment_index,
+                segment_start_message=excluded.segment_start_message,
+                segment_end_message=excluded.segment_end_message,
+                segment_reason=excluded.segment_reason""",
                 (
-                    session_id,
-                    display_title,
-                    transcript,
-                    " ".join(files),
-                    " ".join(commands),
+                    session_id, project, source, session.get("model"),
+                    session.get("start_time"), session.get("end_time"), duration,
+                    session.get("git_branch"),
+                    stats.get("user_messages", 0), stats.get("assistant_messages", 0),
+                    stats.get("tool_uses", 0), stats.get("input_tokens", 0),
+                    stats.get("output_tokens", 0), display_title,
+                    badges["outcome_badge"], json.dumps(badges["value_badges"]),
+                    json.dumps(badges["risk_badges"]), badges["sensitivity_score"],
+                    badges["task_type"], json.dumps(files), json.dumps(commands),
+                    str(blob_path), session.get("raw_source_path"), content_hash,
+                    now, now, session.get("parent_session_id"), session.get("segment_index"),
+                    session.get("segment_message_range", [None, None])[0] if session.get("segment_message_range") else None,
+                    session.get("segment_message_range", [None, None])[1] if session.get("segment_message_range") else None,
+                    session.get("segment_reason"),
                 ),
             )
 
-        if is_new:
-            new_count += 1
+            if content_changed:
+                conn.execute(
+                    """UPDATE sessions SET review_status='new', selection_reason=NULL,
+                    reviewer_notes=NULL, reviewed_at=NULL, bundle_id=NULL,
+                    ai_quality_score=NULL, ai_score_reason=NULL,
+                    ai_episode_quality=NULL, ai_quality_tier=NULL,
+                    ai_scoring_detail=NULL, ai_task_type=NULL,
+                    ai_outcome_badge=NULL, ai_value_badges=NULL,
+                    ai_risk_badges=NULL, ai_display_title=NULL
+                    WHERE session_id=?""",
+                    (session_id,),
+                )
 
-    conn.commit()
+            if has_fts:
+                conn.execute(
+                    "INSERT INTO sessions_fts(session_id, display_title, transcript_text, files_touched, commands_run) VALUES(?, ?, ?, ?, ?)",
+                    (session_id, display_title, _flatten_transcript(session), " ".join(files), " ".join(commands)),
+                )
+
+            if is_new:
+                new_count += 1
+
+        for bundle_id in affected_bundles:
+            conn.execute(
+                "UPDATE bundles SET session_count=(SELECT COUNT(*) FROM sessions WHERE bundle_id=?) WHERE bundle_id=?",
+                (bundle_id, bundle_id),
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     return new_count
 
 
@@ -520,6 +573,8 @@ def query_sessions(
     if order.lower() not in ("asc", "desc"):
         order = "desc"
 
+    limit = min(max(int(limit), 1), 1000)
+    offset = max(int(offset), 0)
     params: list[Any] = []
     where_clauses: list[str] = []
 
@@ -530,7 +585,10 @@ def query_sessions(
             "JOIN sessions_fts f ON s.session_id = f.session_id "
             "WHERE sessions_fts MATCH ?"
         )
-        params.append(search_text)
+        normalized_query = _normalize_fts_query(search_text)
+        if not normalized_query:
+            return []
+        params.append(normalized_query)
     else:
         base = "SELECT * FROM sessions s WHERE 1=1"
 
@@ -555,7 +613,12 @@ def query_sessions(
     sql += f" ORDER BY s.{sort} {order.upper()} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
-    rows = conn.execute(sql, params).fetchall()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        if search_text and "fts5" in str(exc).lower():
+            return []
+        raise
     return [dict(row) for row in rows]
 
 
@@ -575,10 +638,13 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, A
 
     # Load messages from blob
     blob_path_str = result.get("blob_path")
-    blob_path = Path(blob_path_str) if blob_path_str else None
+    blob_path = Path(blob_path_str).resolve() if blob_path_str else None
+    blobs_root = BLOBS_DIR.resolve()
+    if blob_path and not blob_path.is_relative_to(blobs_root):
+        blob_path = None
     # Fallback: if stored path is stale, try the canonical location
-    if blob_path and not blob_path.exists():
-        fallback = BLOBS_DIR / f"{session_id}.json"
+    if (blob_path is None or not blob_path.exists()) and result.get("content_hash"):
+        fallback = _canonical_blob_path(session_id, result["content_hash"])
         if fallback.exists():
             blob_path = fallback
     if blob_path and blob_path.exists():
@@ -753,10 +819,12 @@ def search_fts(
     if not _has_fts(conn):
         return []
 
-    terms = re.findall(r"\w+", query, flags=re.UNICODE)
-    if not terms:
+    normalized_query = _normalize_fts_query(query)
+    if not normalized_query:
         return []
-    normalized_query = " AND ".join(f'"{term}"' for term in terms)
+
+    limit = min(max(int(limit), 1), 1000)
+    offset = max(int(offset), 0)
 
     rows = conn.execute(
         "SELECT s.* FROM sessions s "
@@ -767,6 +835,12 @@ def search_fts(
         (normalized_query, limit, offset),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _normalize_fts_query(query: str) -> str:
+    """Turn arbitrary user text into a safe literal FTS5 AND query."""
+    terms = re.findall(r"\w+", str(query), flags=re.UNICODE)
+    return " AND ".join(f'"{term}"' for term in terms)
 
 
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -921,13 +995,15 @@ def create_bundle(
 
     # Verify all sessions exist
     found_ids: set[str] = set()
+    old_bundle_ids: set[str] = set()
     if session_ids:
         placeholders = ", ".join("?" for _ in session_ids)
         rows = conn.execute(
-            f"SELECT session_id FROM sessions WHERE session_id IN ({placeholders})",
+            f"SELECT session_id, bundle_id FROM sessions WHERE session_id IN ({placeholders})",
             session_ids,
         ).fetchall()
         found_ids = {row["session_id"] for row in rows}
+        old_bundle_ids = {row["bundle_id"] for row in rows if row["bundle_id"]}
 
     conn.execute(
         """INSERT INTO bundles (
@@ -942,6 +1018,12 @@ def create_bundle(
         conn.execute(
             "UPDATE sessions SET bundle_id = ?, updated_at = ? WHERE session_id = ?",
             (bundle_id, now, sid),
+        )
+
+    for old_bundle_id in old_bundle_ids:
+        conn.execute(
+            "UPDATE bundles SET session_count=(SELECT COUNT(*) FROM sessions WHERE bundle_id=?) WHERE bundle_id=?",
+            (old_bundle_id, old_bundle_id),
         )
 
     conn.commit()
@@ -1037,6 +1119,92 @@ EXPORT_FIELDS = {
 }
 
 
+def build_bundle_export(
+    conn: sqlite3.Connection,
+    bundle_id: str,
+    bundle: dict[str, Any],
+    *,
+    custom_strings: list[str] | None = None,
+    user_allowlist: list[dict[str, Any]] | None = None,
+    extra_usernames: list[str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Build the single canonical, redacted representation of a bundle."""
+    from .anonymizer import Anonymizer
+    from .secrets import redact_session
+
+    anonymizer = Anonymizer(extra_usernames=extra_usernames or [])
+
+    def anonymize(value: Any) -> Any:
+        if isinstance(value, str):
+            return anonymizer.text(value)
+        if isinstance(value, list):
+            return [anonymize(item) for item in value]
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                safe_key = anonymizer.text(str(key))
+                while safe_key in result:
+                    safe_key += "_"
+                result[safe_key] = anonymize(item)
+            return result
+        return value
+
+    lines: list[str] = []
+    redaction_types: dict[str, int] = {}
+    manifest: dict[str, Any] = {
+        "bundle_id": bundle_id,
+        "session_count": 0,
+        "sessions": [],
+    }
+    manifest_metadata, total_redactions, metadata_log = redact_session(
+        {
+            "attestation": bundle.get("attestation"),
+            "submission_note": bundle.get("submission_note"),
+        },
+        custom_strings=custom_strings,
+        user_allowlist=user_allowlist,
+    )
+    manifest.update(anonymize(manifest_metadata))
+    for entry in metadata_log:
+        redaction_type = entry.get("type", "unknown")
+        redaction_types[redaction_type] = redaction_types.get(redaction_type, 0) + 1
+    metadata_custom_count = total_redactions - len(metadata_log)
+    if metadata_custom_count > 0:
+        redaction_types["custom"] = metadata_custom_count
+
+    for session_row in bundle.get("sessions", []):
+        detail = get_session_detail(conn, session_row["session_id"])
+        if not detail:
+            continue
+        detail, n_redacted, redaction_log = redact_session(
+            detail, custom_strings=custom_strings, user_allowlist=user_allowlist,
+        )
+        detail = anonymize(detail)
+        total_redactions += n_redacted
+        for entry in redaction_log:
+            redaction_type = entry.get("type", "unknown")
+            redaction_types[redaction_type] = redaction_types.get(redaction_type, 0) + 1
+        custom_count = n_redacted - len(redaction_log)
+        if custom_count > 0:
+            redaction_types["custom"] = redaction_types.get("custom", 0) + custom_count
+
+        clean = {key: value for key, value in detail.items() if key in EXPORT_FIELDS}
+        lines.append(json.dumps(clean, default=str))
+        manifest["sessions"].append({
+            "session_id": clean.get("session_id"),
+            "project": clean.get("project"),
+            "source": clean.get("source"),
+            "model": clean.get("model"),
+        })
+
+    manifest["session_count"] = len(manifest["sessions"])
+    manifest["redaction_summary"] = {
+        "total_redactions": total_redactions,
+        "by_type": redaction_types,
+    }
+    return lines, manifest
+
+
 def export_bundle_to_disk(
     conn: sqlite3.Connection,
     bundle_id: str,
@@ -1044,6 +1212,8 @@ def export_bundle_to_disk(
     *,
     output_path: str | None = None,
     custom_strings: list[str] | None = None,
+    user_allowlist: list[dict[str, Any]] | None = None,
+    extra_usernames: list[str] | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
     """Export a bundle's sessions to disk as JSONL + manifest.
 
@@ -1057,61 +1227,49 @@ def export_bundle_to_disk(
             return None, {}
     else:
         export_dir = CONFIG_DIR / "bundles" / bundle_id
-    export_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(export_dir)
 
     sessions_file = export_dir / "sessions.jsonl"
-    tmp_sessions_file = export_dir / "sessions.jsonl.tmp"
-    manifest: dict[str, Any] = {
-        "bundle_id": bundle_id,
-        "export_path": str(export_dir),
-        "session_count": bundle.get("session_count", 0),
-        "attestation": bundle.get("attestation"),
-        "submission_note": bundle.get("submission_note"),
-        "sessions": [],
-    }
-
-    from .secrets import redact_session
-
-    total_redactions = 0
-    redaction_types: dict[str, int] = {}
+    lines, manifest = build_bundle_export(
+        conn, bundle_id, bundle,
+        custom_strings=custom_strings,
+        user_allowlist=user_allowlist,
+        extra_usernames=extra_usernames,
+    )
+    manifest["export_path"] = str(export_dir)
+    sessions_fd, tmp_sessions_name = tempfile.mkstemp(
+        prefix=".sessions-", suffix=".tmp", dir=export_dir,
+    )
+    tmp_sessions_file = Path(tmp_sessions_name)
 
     try:
-        with open(tmp_sessions_file, "w") as f:
-            for s in bundle.get("sessions", []):
-                detail = get_session_detail(conn, s["session_id"])
-                if detail:
-                    detail, n_redacted, redaction_log = redact_session(detail, custom_strings=custom_strings)
-                    total_redactions += n_redacted
-                    for entry in redaction_log:
-                        rtype = entry.get("type", "unknown")
-                        redaction_types[rtype] = redaction_types.get(rtype, 0) + 1
-                    # Custom string redactions are counted in n_redacted but
-                    # don't produce log entries — track them separately.
-                    custom_count = n_redacted - len(redaction_log)
-                    if custom_count > 0:
-                        redaction_types["custom"] = redaction_types.get("custom", 0) + custom_count
-                    clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
-                    f.write(json.dumps(clean, default=str) + "\n")
-                    manifest["sessions"].append({
-                        "session_id": s["session_id"],
-                        "project": s.get("project"),
-                        "source": s.get("source"),
-                        "model": s.get("model"),
-                    })
+        with os.fdopen(sessions_fd, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_sessions_file, sessions_file)
+        _ensure_private_file(sessions_file)
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
         raise
 
-    # Update count to match actually exported sessions (some may have missing blobs)
-    manifest["session_count"] = len(manifest["sessions"])
-    manifest["redaction_summary"] = {
-        "total_redactions": total_redactions,
-        "by_type": redaction_types,
-    }
-
-    with open(export_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
+    manifest_file = export_dir / "manifest.json"
+    fd, manifest_tmp_name = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=export_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(manifest_tmp_name, 0o600)
+        os.replace(manifest_tmp_name, manifest_file)
+        _ensure_private_file(manifest_file)
+    except BaseException:
+        try:
+            os.unlink(manifest_tmp_name)
+        except OSError:
+            pass
+        raise
 
     conn.execute(
         "UPDATE bundles SET status = 'exported', manifest = ? WHERE bundle_id = ?",

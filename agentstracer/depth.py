@@ -179,8 +179,12 @@ def extract_workflow_steps(
     for msg in messages:
         tool_uses = msg.get("tool_uses", [])
         for tu in tool_uses:
-            tool_name = tu.get("tool", tu.get("name", "unknown"))
+            if not isinstance(tu, dict):
+                continue
+            tool_name = str(tu.get("tool") or tu.get("name") or "unknown")
             tool_input = tu.get("input") or {}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
             tool_output = tu.get("output") or {}
             status = tu.get("status", "success")
             output_text = ""
@@ -253,9 +257,9 @@ def extract_workflow_steps(
     return steps
 
 
-def _normalize_tool_name(name: str) -> str:
+def _normalize_tool_name(name: str | None) -> str:
     """Normalize tool names to a small set."""
-    lower = name.lower()
+    lower = str(name or "unknown").lower()
     if lower in ("read", "view", "cat"):
         return "read"
     if lower in ("edit", "write", "notebookedit"):
@@ -273,24 +277,17 @@ def _parse_test_outcome(output: str) -> str | None:
     """Try to extract test results from command output."""
     if not output:
         return None
-    # pytest: "5 passed, 1 failed"
-    m = re.search(r"(\d+)\s+passed(?:.*?(\d+)\s+failed)?", output)
-    if m:
-        passed = int(m.group(1))
-        failed = int(m.group(2)) if m.group(2) else 0
-        total = passed + failed
-        if failed:
-            return f"{passed}/{total} passed"
-        return f"{total}/{total} passed"
-    # jest/vitest: "Tests: 3 passed, 1 failed, 4 total"
-    m = re.search(r"Tests:\s*(\d+)\s+passed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+total)?", output)
-    if m:
-        passed = int(m.group(1))
-        failed = int(m.group(2)) if m.group(2) else 0
-        total = int(m.group(3)) if m.group(3) else passed + failed
-        if failed:
-            return f"{passed}/{total} passed"
-        return f"{total}/{total} passed"
+    # Pytest/Jest/Vitest may print counts in any order (often failures first).
+    passed_match = re.search(r"(\d+)\s+passed\b", output, re.IGNORECASE)
+    failed_match = re.search(r"(\d+)\s+failed\b", output, re.IGNORECASE)
+    error_match = re.search(r"(\d+)\s+errors?\b", output, re.IGNORECASE)
+    total_match = re.search(r"(\d+)\s+total\b", output, re.IGNORECASE)
+    if passed_match or failed_match or error_match:
+        passed = int(passed_match.group(1)) if passed_match else 0
+        failed = int(failed_match.group(1)) if failed_match else 0
+        errors = int(error_match.group(1)) if error_match else 0
+        total = int(total_match.group(1)) if total_match else passed + failed + errors
+        return f"{passed}/{total} passed" if failed or errors else f"{total}/{total} passed"
     # Generic pass/fail detection
     lower = output.lower()
     if "passed" in lower and "failed" not in lower and "error" not in lower:

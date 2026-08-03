@@ -30,9 +30,7 @@ agentstracer = "agentstracer.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agentstracer*"]
-
-[tool.setuptools.package-data]
-"agentstracer" = ["web/frontend/dist/**/*"]
+exclude = ["agentstracer.web.frontend.node_modules*"]
 
 [project.urls]
 Homepage = "https://github.com/cyijun/agentstracer"

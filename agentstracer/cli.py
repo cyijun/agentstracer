@@ -1,10 +1,13 @@
 """CLI for AgentsTrace — export and manage coding agent conversation data."""
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import socket
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, cast
@@ -13,7 +16,7 @@ from .anonymizer import Anonymizer
 from .config import CONFIG_FILE, AgentsTraceConfig, load_config, save_config
 from .parser import CLAUDE_DIR, CODEX_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_SESSIONS_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
 from .backends import BACKEND_CHOICES
-from .pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
+from .pii import apply_findings_to_session, load_findings, load_jsonl_sessions, merge_findings, review_session_pii, review_session_pii_with_agent, write_findings, write_jsonl_sessions
 from .scoring import SCORING_BACKEND_CHOICES
 from .secrets import _has_mixed_char_types, _shannon_entropy, redact_session
 
@@ -302,6 +305,13 @@ def _merge_config_list(config: AgentsTraceConfig, key: str, new_values: list[str
     config[key] = sorted(existing)
 
 
+def _save_config_checked(config: AgentsTraceConfig) -> None:
+    """Stop the workflow when a privacy-critical configuration write fails."""
+    if save_config(config) is False:
+        print(json.dumps({"error": f"Could not save privacy configuration to {CONFIG_FILE}"}))
+        raise SystemExit(1)
+
+
 def configure(
     source: str | None = None,
     exclude: list[str] | None = None,
@@ -309,12 +319,15 @@ def configure(
     redact_usernames: list[str] | None = None,
     confirm_projects: bool = False,
     no_secrets_redaction: bool | None = None,
+    clear_excludes: bool = False,
 ):
     """Set config values non-interactively. Lists are MERGED (append), not replaced."""
     config = load_config()
     if source is not None:
         config["source"] = source
-    if exclude is not None:
+    if clear_excludes:
+        config["excluded_projects"] = []
+    elif exclude is not None:
         _merge_config_list(config, "excluded_projects", exclude)
     if redact is not None:
         _merge_config_list(config, "redact_strings", redact)
@@ -324,7 +337,7 @@ def configure(
         config["no_secrets_redaction"] = no_secrets_redaction
     if confirm_projects:
         config["projects_confirmed"] = True
-    save_config(config)
+    _save_config_checked(config)
     print(f"Config saved to {CONFIG_FILE}")
     print(json.dumps(_mask_config_for_display(config), indent=2))
 
@@ -421,6 +434,7 @@ def export_to_jsonl(
     include_thinking: bool = True,
     custom_strings: list[str] | None = None,
     no_secrets_redaction: bool = False,
+    user_allowlist: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Export selected projects to JSONL. Returns metadata."""
     total = 0
@@ -432,44 +446,60 @@ def export_to_jsonl(
     project_names = []
 
     try:
-        fh = open(output_path, "w")
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.", suffix=".tmp",
+            dir=output_path.parent,
+        )
     except OSError as e:
         print(f"Error: cannot write to {output_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    with fh as f:
-        for project in selected_projects:
-            print(f"  Parsing {project['display_name']}...", end="", flush=True)
-            sessions = parse_project_sessions(
-                project["dir_name"], anonymizer=anonymizer,
-                include_thinking=include_thinking,
-                source=project.get("source", "unknown"),
-            )
-            proj_count = 0
-            for session in sessions:
-                model = session.get("model")
-                if not model or model == "<synthetic>":
-                    skipped += 1
-                    continue
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for project in selected_projects:
+                print(f"  Parsing {project['display_name']}...", end="", flush=True)
+                sessions = parse_project_sessions(
+                    project["dir_name"], anonymizer=anonymizer,
+                    include_thinking=include_thinking,
+                    source=project.get("source", "unknown"),
+                )
+                proj_count = 0
+                for session in sessions:
+                    model = session.get("model")
+                    if not model or model == "<synthetic>":
+                        skipped += 1
+                        continue
 
-                # Secrets redaction (can be disabled for private use)
-                if not no_secrets_redaction:
-                    session, n_redacted, _ = redact_session(session, custom_strings=custom_strings)
-                    total_redactions += n_redacted
+                    # Secrets redaction (can be disabled for private use)
+                    if not no_secrets_redaction:
+                        session, n_redacted, _ = redact_session(
+                            session,
+                            custom_strings=custom_strings,
+                            user_allowlist=user_allowlist,
+                        )
+                        total_redactions += n_redacted
 
-                # Anonymize metadata fields that could leak PII (paths, usernames)
-                _anonymize_session_metadata(session, anonymizer, custom_strings)
+                    # Anonymize metadata fields that could leak PII (paths, usernames)
+                    _anonymize_session_metadata(session, anonymizer, custom_strings)
 
-                f.write(json.dumps(session, ensure_ascii=False) + "\n")
-                total += 1
-                proj_count += 1
-                models[model] = models.get(model, 0) + 1
-                stats = session.get("stats", {})
-                total_input_tokens += stats.get("input_tokens", 0)
-                total_output_tokens += stats.get("output_tokens", 0)
-            if proj_count:
-                project_names.append(project["display_name"])
-            print(f" {proj_count} sessions")
+                    f.write(json.dumps(session, ensure_ascii=False) + "\n")
+                    total += 1
+                    proj_count += 1
+                    models[model] = models.get(model, 0) + 1
+                    stats = session.get("stats", {})
+                    total_input_tokens += stats.get("input_tokens", 0)
+                    total_output_tokens += stats.get("output_tokens", 0)
+                if proj_count:
+                    project_names.append(project["display_name"])
+                print(f" {proj_count} sessions")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_path)
+        os.chmod(output_path, 0o600)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return {
         "sessions": total,
@@ -511,19 +541,21 @@ def update_skill(target: str) -> None:
         print(f"Error: unknown target '{target}'. Supported: {', '.join(SKILL_TARGETS)}", file=sys.stderr)
         sys.exit(1)
 
-    dest = Path.cwd() / target_config["dest_template"]
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
     # NOTE: Network download disabled - local-only mode
     # Only use bundled local copy
     bundled = Path(__file__).resolve().parent.parent / "skills" / "agentstracer" / target_config["source_file"]
-    if bundled.exists():
-        content = bundled.read_text()
-    else:
-        print(f"Error: Local skill file not found at {bundled}. Network download is disabled in this build.", file=sys.stderr)
-        sys.exit(1)
+    if not bundled.is_file():
+        print(
+            "The update-skill compatibility command is unavailable because "
+            "this local-only build does not include a bundled skill.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    content = bundled.read_text(encoding="utf-8")
 
-    dest.write_text(content)
+    dest = Path.cwd() / target_config["dest_template"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content, encoding="utf-8")
     print(f"Skill installed to {dest}")
     print(json.dumps({
         "installed": str(dest),
@@ -689,11 +721,10 @@ def _scan_pii(file_path: Path) -> dict:
     """Run PII regex scans on the export file. Returns dict of findings."""
     import re
 
-    p = str(file_path.resolve())
     scans = {
         "emails": r'[a-zA-Z0-9.+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}',
         "jwt_tokens": r'eyJ[A-Za-z0-9_-]{20,}',
-        "api_keys": r'(ghp_|sk-|hf_)[A-Za-z0-9_-]{10,}',
+        "api_keys": r'(?:ghp_|sk-|hf_)[A-Za-z0-9_-]{10,}',
         "ip_addresses": r'[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}',
     }
     # Known false positives
@@ -730,6 +761,15 @@ def _normalize_attestation_text(value: object) -> str:
     if isinstance(value, str):
         return " ".join(value.split()).strip()
     return " ".join(str(value).split()).strip()
+
+
+def _private_text_receipt(value: str) -> dict[str, Any]:
+    """Persist proof of review without retaining the reviewed plaintext."""
+    return {
+        "provided": bool(value),
+        "length": len(value),
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest() if value else None,
+    }
 
 
 def _extract_manual_scan_sessions(attestation: str) -> int | None:
@@ -858,7 +898,7 @@ def confirm(
 ) -> None:
     """Scan export for PII, summarize projects, and unlock pushing. JSON output."""
     config = load_config()
-    last_export = config.get("last_export", {})
+    last_export = config.get("last_export") or {}
     file_path = _find_export_file(file_path)
 
     normalized_full_name = _normalize_attestation_text(full_name)
@@ -906,6 +946,7 @@ def confirm(
         }, indent=2))
         sys.exit(1)
 
+    full_name_scan: dict[str, Any]
     if skip_full_name_scan:
         full_name_scan = {
             "query": None,
@@ -942,25 +983,32 @@ def confirm(
     # Run PII scans
     pii_findings = _scan_pii(file_path)
 
-    # Advance stage from review -> confirmed
-    config["stage"] = "confirmed"
-    config["review_attestations"] = attestations
+    unresolved = bool(pii_findings) or bool(full_name_scan.get("match_count", 0))
+    resulting_stage = "review" if unresolved else "confirmed"
+    full_name_receipt = _private_text_receipt(normalized_full_name)
+    attestation_receipts = {
+        key: _private_text_receipt(value) for key, value in attestations.items()
+    }
+    config["stage"] = resulting_stage
+    config["review_attestations"] = attestation_receipts
     config["review_verification"] = {
-        "full_name": normalized_full_name if not skip_full_name_scan else None,
+        "full_name_receipt": full_name_receipt if not skip_full_name_scan else None,
         "full_name_scan_skipped": skip_full_name_scan,
         "full_name_matches": full_name_scan.get("match_count", 0),
         "manual_scan_sessions": manual_scan_sessions,
+        "unresolved_findings": unresolved,
     }
     config["last_confirm"] = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "file": str(file_path.resolve()),
         "pii_findings": bool(pii_findings),
-        "full_name": normalized_full_name if not skip_full_name_scan else None,
+        "full_name_receipt": full_name_receipt if not skip_full_name_scan else None,
         "full_name_scan_skipped": skip_full_name_scan,
         "full_name_matches": full_name_scan.get("match_count", 0),
         "manual_scan_sessions": manual_scan_sessions,
+        "status": "blocked" if unresolved else "confirmed",
     }
-    save_config(config)
+    _save_config_checked(config)
 
     next_steps = [
         "Show the user the project breakdown, full-name scan, and PII scan results above.",
@@ -976,8 +1024,8 @@ def confirm(
     if pii_findings:
         next_steps.append(
             "PII findings detected — review each one with the user. "
-            "If real: agentstracer config --redact \"string\" then re-export. "
-            "False positives can be ignored."
+            "Add confirmed sensitive values with agentstracer config --redact \"string\", "
+            "then re-export and rerun confirmation. Confirmation remains blocked while findings exist."
         )
     if "high_entropy_strings" in pii_findings:
         next_steps.append(
@@ -988,11 +1036,24 @@ def confirm(
         )
     next_steps.extend([
         "If any project should be excluded, run: agentstracer config --exclude \"project_name\" and re-export.",
-        f"Review is complete. {total} sessions ({_format_size(file_size)}) exported locally.",
+        (
+            f"Review remains blocked by unresolved findings in {total} sessions "
+            f"({_format_size(file_size)}). Redact or remove them, re-export, and confirm again."
+            if unresolved else
+            f"Review is complete. {total} sessions ({_format_size(file_size)}) exported locally."
+        ),
     ])
 
+    public_full_name_scan = {
+        key: value for key, value in full_name_scan.items()
+        if key not in {"query", "examples"}
+    }
+    public_full_name_scan["query_receipt"] = (
+        full_name_receipt if not skip_full_name_scan else None
+    )
+
     result = {
-        "stage": "confirmed",
+        "stage": resulting_stage,
         "stage_number": 3,
         "total_stages": 4,
         "file": str(file_path.resolve()),
@@ -1004,12 +1065,12 @@ def confirm(
         ],
         "models": {m: c for m, c in sorted(models.items(), key=lambda x: -x[1])},
         "pii_scan": pii_findings if pii_findings else "clean",
-        "full_name_scan": full_name_scan,
+        "full_name_scan": public_full_name_scan,
         "manual_scan_sessions": manual_scan_sessions,
         "last_export_timestamp": last_export.get("timestamp"),
         "next_steps": next_steps,
-        "next_command": None,
-        "attestations": attestations,
+        "next_command": None if not unresolved else "agentstracer export",
+        "attestations": attestation_receipts,
     }
     print(json.dumps(result, indent=2))
 
@@ -1055,7 +1116,7 @@ def prep(source_filter: str = "auto") -> None:
 
     # Persist stage
     config["stage"] = stage
-    save_config(config)
+    _save_config_checked(config)
 
     result = {
         "stage": stage,
@@ -1394,6 +1455,8 @@ def _run_bundle_export(args) -> None:
 
     config = load_config()
     custom_strings = config.get("redact_strings", []) or None
+    user_allowlist = config.get("allowlist_entries", []) or None
+    extra_usernames = config.get("redact_usernames", []) or None
 
     conn = open_index()
     try:
@@ -1411,6 +1474,8 @@ def _run_bundle_export(args) -> None:
             conn, bundle_id, bundle,
             output_path=args.output,
             custom_strings=custom_strings,
+            user_allowlist=user_allowlist,
+            extra_usernames=extra_usernames,
         )
         if export_dir is None:
             print("Output path must be under home directory or /tmp.")
@@ -1538,50 +1603,32 @@ def _print_share_pii_warning(output_json: bool = False) -> dict[str, Any]:
 
 
 def _run_bundle_share(args) -> None:
-    """Share a bundle via the ingest service."""
-    from .daemon import share_bundle
-    from .index import open_index
-
-    config = load_config()
-    custom_strings = config.get("redact_strings", []) or None
-
-    conn = open_index()
-    try:
-        bundle_id = _resolve_bundle_id(conn, args.bundle_id)
-        if bundle_id is None:
-            print(f"Bundle not found: {args.bundle_id}")
-            sys.exit(1)
-
-        pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        result = share_bundle(conn, bundle_id, force=args.force, custom_strings=custom_strings)
-        if result.get("ok"):
-            if getattr(args, "json", False):
-                result.pop("status", None)
-                result.pop("gcs_uri", None)
-                result["pii_status"] = pii_status
-                print(json.dumps(result, indent=2))
-            else:
-                count = result.get("session_count", "?")
-                print(f"Bundle {bundle_id[:8]} uploaded successfully. {count} sessions shared.")
-                redaction_summary = result.get("redaction_summary")
-                if redaction_summary is not None:
-                    print(f"Privacy: {_format_redaction_summary(redaction_summary)}")
-        else:
-            print(result.get("error", "Share failed."))
-            sys.exit(1)
-    except Exception as exc:
-        print(f"Share failed: {exc}")
-        sys.exit(1)
-    finally:
-        conn.close()
+    """Retained compatibility entrypoint for builds without remote sharing."""
+    message = (
+        "Remote bundle sharing is unavailable in this local-only build. "
+        "Use `agentstracer bundle-export` to create a redacted local artifact."
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": False, "error": message}))
+    else:
+        print(message, file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _run_share(args) -> None:
-    """One-step: create bundle + export + share. With --preview, show what would be shared."""
+    """Preview candidate sessions; remote uploading is intentionally disabled."""
     from .index import open_index, query_sessions
 
-    config = load_config()
-    custom_strings = config.get("redact_strings", []) or None
+    if not getattr(args, "preview", False):
+        message = (
+            "Remote sharing is unavailable in this local-only build. "
+            "Use `share --preview` and then `bundle-create`/`bundle-export`."
+        )
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": message}))
+        else:
+            print(message, file=sys.stderr)
+        raise SystemExit(2)
 
     conn = open_index()
     try:
@@ -1605,73 +1652,14 @@ def _run_share(args) -> None:
             print("No sessions to share. Provide session IDs or use --status approved.")
             sys.exit(1)
 
-        # Use found IDs (some provided IDs may not exist in DB)
-        session_ids = [s["session_id"] for s in session_rows]
-
-        if getattr(args, "preview", False):
-            pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-            if getattr(args, "json", False):
-                payload = _share_preview(session_rows, output_json=True)
-                payload["pii_status"] = pii_status
-                print(json.dumps(payload, indent=2))
-            else:
-                _share_preview(session_rows, output_json=False)
-            return
-
-        # AI PII review before sharing — mandatory for upload
-        from .index import get_session_detail
-        from .pii import apply_findings_to_session
-
-        print(f"\nRunning AI PII review on {len(session_ids)} sessions before sharing...", file=sys.stderr)
-        full_sessions = []
-        for sid in session_ids:
-            detail = get_session_detail(conn, sid)
-            if detail:
-                full_sessions.append(detail)
-
-        if full_sessions:
-            pii_findings = _collect_pii_findings(full_sessions, "hybrid", backend="auto", limit_sessions=10)
-            if pii_findings:
-                # Show summary of what was found
-                by_type: dict[str, int] = {}
-                for f in pii_findings:
-                    t = f.get("entity_type", "unknown")
-                    by_type[t] = by_type.get(t, 0) + 1
-                print(f"\n  PII findings: {len(pii_findings)} entities detected", file=sys.stderr)
-                for entity_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
-                    sample = next((f["entity_text"] for f in pii_findings if f.get("entity_type") == entity_type), "")
-                    print(f"    {entity_type}: {count} (e.g. \"{sample[:30]}\")", file=sys.stderr)
-                print(f"\n  These will be redacted before sharing.", file=sys.stderr)
-            else:
-                print(f"  No additional PII found by AI review.", file=sys.stderr)
-
-        # share_bundle handles export internally, no need to export first
-        from .daemon import share_bundle
-        from .index import create_bundle
-
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        bundle_id = create_bundle(conn, session_ids, note=args.note)
-        result = share_bundle(conn, bundle_id, force=args.force, custom_strings=custom_strings)
-        if result.get("ok"):
-            if getattr(args, "json", False):
-                result["bundle_id"] = bundle_id
-                result["pii_status"] = pii_status
-                result.pop("status", None)
-                result.pop("gcs_uri", None)
-                print(json.dumps(result, indent=2))
-            else:
-                count = result.get("session_count", len(session_ids))
-                print(f"Shared {count} sessions.")
-                print(f"Bundle {bundle_id[:8]} uploaded successfully.")
-                redaction_summary = result.get("redaction_summary")
-                if redaction_summary is not None:
-                    print(f"Privacy: {_format_redaction_summary(redaction_summary)}")
+        if getattr(args, "json", False):
+            payload = _share_preview(session_rows, output_json=True)
+            assert payload is not None
+            payload["pii_status"] = pii_status
+            print(json.dumps(payload, indent=2))
         else:
-            print(result.get("error", "Share failed."))
-            sys.exit(1)
-    except Exception as exc:
-        print(f"Share failed: {exc}")
-        sys.exit(1)
+            _share_preview(session_rows, output_json=False)
     finally:
         conn.close()
 
@@ -2337,7 +2325,7 @@ def _run_score(args) -> None:
             elif result.get("error"):
                 print(f"  -> Error: {result['error']}", file=sys.stderr)
             elif result.get("dry_run"):
-                print(f"  -> (dry run)", file=sys.stderr)
+                print("  -> (dry run)", file=sys.stderr)
 
         scored = [r for r in results if r.get("ok")]
         errors = [r for r in results if r.get("error")]
@@ -2547,7 +2535,6 @@ def _run_segment(args: argparse.Namespace) -> None:
         for r in results:
             print(f"\n  {r['parent_session_id'][:12]}... ({r['parent_messages']} msgs)")
             for seg in r["segments"]:
-                msgs = seg["message_range"]
                 print(f"    {seg['session_id'][-8:]:>10} │ {seg['title'][:50]:50} │ {seg['reason']}")
 
 
@@ -2666,7 +2653,14 @@ def _run_card(args: argparse.Namespace) -> None:
     from .card import generate_card
     from .index import get_session_detail, open_index
     from .secrets import redact_session
+    from .trace_model import sanitize_value
 
+    config = load_config()
+    custom_strings = list(config.get("redact_strings", []))
+    user_allowlist = list(config.get("allowlist_entries", []))
+    anonymizer = Anonymizer(
+        extra_usernames=list(config.get("redact_usernames", []))
+    )
     conn = open_index()
     cards = []
 
@@ -2678,7 +2672,25 @@ def _run_card(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         # Apply redaction
-        session_redacted, redact_count, _log = redact_session(session)
+        # Cards are explicitly share-oriented artifacts, so they always use
+        # the safe redactor even when private local exports opted out of
+        # automatic secret redaction.  All configured custom strings,
+        # usernames, and allowlist entries still apply.
+        session_redacted, redact_count, _log = redact_session(
+            session,
+            custom_strings=custom_strings,
+            user_allowlist=user_allowlist,
+        )
+        session_redacted = sanitize_value(
+            session_redacted,
+            anonymizer=anonymizer,
+            custom_strings=custom_strings,
+            redact_secrets=True,
+        )
+        assert isinstance(session_redacted, dict)
+        _anonymize_session_metadata(
+            session_redacted, anonymizer, custom_strings,
+        )
         session_redacted["_redaction_count"] = redact_count
 
         card_result = generate_card(session_redacted, depth=args.depth)
@@ -2713,12 +2725,12 @@ def _run_langfuse(args) -> None:
 
     try:
         if args.langfuse_command == "doctor":
-            client = LangfuseOTLPClient(LangfuseConfig.from_env())
-            print(json.dumps(client.doctor(), ensure_ascii=False, indent=2))
+            doctor_client = LangfuseOTLPClient(LangfuseConfig.from_env())
+            print(json.dumps(doctor_client.doctor(), ensure_ascii=False, indent=2))
             return
         if args.langfuse_command == "smoke":
-            client = LangfuseOTLPClient(LangfuseConfig.from_env())
-            result = smoke_test(client)
+            smoke_client = LangfuseOTLPClient(LangfuseConfig.from_env())
+            result = smoke_test(smoke_client)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             if not result["ok"]:
                 raise SystemExit(1)
@@ -2727,7 +2739,9 @@ def _run_langfuse(args) -> None:
         selected = args.source or ["all"]
         sources = list(TRACE_SOURCES) if "all" in selected else list(dict.fromkeys(selected))
         dry_run = args.langfuse_command == "preview"
-        client = None if dry_run else LangfuseOTLPClient(LangfuseConfig.from_env())
+        client: LangfuseOTLPClient | None = (
+            None if dry_run else LangfuseOTLPClient(LangfuseConfig.from_env())
+        )
         local_config = load_config()
         anonymizer = Anonymizer(extra_usernames=local_config.get("redact_usernames", []))
         custom_strings = tuple(local_config.get("redact_strings", []))
@@ -2787,20 +2801,39 @@ def main() -> None:
     list_parser.add_argument("--tokens", action="store_true",
                              help="Output total token count across all sessions (integer only)")
 
-    us = sub.add_parser("update-skill", help="Install/update the agentstracer skill for a coding agent")
+    us = sub.add_parser(
+        "update-skill",
+        help="Install a bundled agentstracer skill when this build includes one",
+    )
     us.add_argument("target", choices=["claude", "openclaw", "codex", "cline"],
                     help="Agent to install skill for")
 
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
                      help="Set export source scope explicitly: claude, codex, gemini, or all")
-    cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
+    exclusion_group = cfg.add_mutually_exclusive_group()
+    exclusion_group.add_argument(
+        "--exclude", type=str, help="Comma-separated projects to exclude"
+    )
+    exclusion_group.add_argument(
+        "--clear-excludes", action="store_true",
+        help="Clear all configured project exclusions",
+    )
     cfg.add_argument("--redact", type=str,
                      help="Comma-separated strings to always redact (API keys, usernames, domains)")
     cfg.add_argument("--redact-usernames", type=str,
                      help="Comma-separated usernames to anonymize (GitHub handles, Discord names)")
-    cfg.add_argument("--no-secrets-redaction", action="store_true",
-                     help="Disable secrets redaction for private use (preserves API keys, tokens)")
+    secret_group = cfg.add_mutually_exclusive_group()
+    secret_group.add_argument(
+        "--no-secrets-redaction", dest="no_secrets_redaction",
+        action="store_const", const=True, default=None,
+        help="Disable secrets redaction for private use (preserves API keys, tokens)",
+    )
+    secret_group.add_argument(
+        "--secrets-redaction", dest="no_secrets_redaction",
+        action="store_const", const=False,
+        help="Re-enable automatic secrets redaction",
+    )
     cfg.add_argument("--confirm-projects", action="store_true",
                      help="Mark project selection as confirmed (include all)")
 
@@ -2847,7 +2880,9 @@ def main() -> None:
     serve_parser.add_argument("--source", choices=["claude", "codex", "openclaw"], default=None,
                               help="Only scan this source")
 
-    refinery_parser = sub.add_parser("refinery", help="Start the data pipeline UI")
+    refinery_parser = sub.add_parser(
+        "refinery", help="Compatibility command (refinery is not bundled)"
+    )
     refinery_parser.add_argument("--port", type=int, default=8385, help="Port (default: 8385)")
     refinery_parser.add_argument("--no-browser", action="store_true", help="Don't open browser")
 
@@ -2921,13 +2956,17 @@ def main() -> None:
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
     be.add_argument("--json", action="store_true", help="Output JSON")
 
-    bs = sub.add_parser("bundle-share", help="Share bundle via ingest service")
+    bs = sub.add_parser(
+        "bundle-share", help="Compatibility command (remote sharing is disabled)"
+    )
     bs.add_argument("bundle_id", help="Bundle ID (or prefix)")
     bs.add_argument("--force", action="store_true", help="Override duplicate check")
     bs.add_argument("--json", action="store_true", help="Output JSON")
 
     # Share command (one-step: create + export + share)
-    sh = sub.add_parser("share", help="Bundle and share sessions in one step")
+    sh = sub.add_parser(
+        "share", help="Preview candidate sessions (remote sharing is disabled)"
+    )
     sh.add_argument("session_ids", nargs="*", help="Session IDs (omit to use --status)")
     sh.add_argument("--status", choices=["approved", "shortlisted"],
                     help="Auto-select sessions with this review status")
@@ -3002,23 +3041,41 @@ def main() -> None:
     srch.add_argument("--json", action="store_true", help="Output JSON for agent parsing")
 
     exp = sub.add_parser("export", help="Export conversation data locally.")
-    # Export flags on both the subcommand and root parser so `agentstracer --push` works
-    for target in (exp, parser):
-        target.add_argument("--output", "-o", type=Path, default=None)
-        target.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
-        target.add_argument("--all-projects", action="store_true")
-        target.add_argument("--no-thinking", action="store_true")
+    # Accept export options both before and after the explicit subcommand.
+    # Suppressed subparser defaults are essential: normal argparse defaults
+    # would overwrite values parsed before ``export``.
+    for target, suppress_defaults in ((parser, False), (exp, True)):
+        default = argparse.SUPPRESS if suppress_defaults else None
+        target.add_argument("--output", "-o", type=Path, default=default)
+        target.add_argument(
+            "--source", choices=SOURCE_CHOICES,
+            default=argparse.SUPPRESS if suppress_defaults else "auto",
+        )
+        target.add_argument(
+            "--all-projects", action="store_true",
+            default=argparse.SUPPRESS if suppress_defaults else False,
+        )
+        target.add_argument(
+            "--no-thinking", action="store_true",
+            default=argparse.SUPPRESS if suppress_defaults else False,
+        )
         target.add_argument("--pii-review", action="store_true",
+                            default=argparse.SUPPRESS if suppress_defaults else False,
                             help="After export, automatically generate structured PII findings")
-        target.add_argument("--pii-provider", choices=["rules", "ai", "claude", "hybrid"], default="rules",
+        target.add_argument(
+            "--pii-provider", choices=["rules", "ai", "claude", "hybrid"],
+            default=argparse.SUPPRESS if suppress_defaults else "rules",
                             help="PII review strategy for local export (default: rules). Use ai/hybrid for AI review.")
-        target.add_argument("--pii-findings-output", type=Path, default=None,
+        target.add_argument("--pii-findings-output", type=Path, default=default,
                             help="Custom findings JSON path for --pii-review")
         target.add_argument("--pii-apply", action="store_true",
+                            default=argparse.SUPPRESS if suppress_defaults else False,
                             help="After PII review, automatically apply findings to produce a sanitized JSONL")
-        target.add_argument("--pii-sanitized-output", type=Path, default=None,
+        target.add_argument("--pii-sanitized-output", type=Path, default=default,
                             help="Custom output path for sanitized JSONL when --pii-apply is enabled")
-        target.add_argument("--pii-backend", choices=list(BACKEND_CHOICES), default="auto",
+        target.add_argument(
+            "--pii-backend", choices=list(BACKEND_CHOICES),
+            default=argparse.SUPPRESS if suppress_defaults else "auto",
                             help="Agent backend for AI-based PII review (default: auto = current agent's CLI)")
 
     args = parser.parse_args()
@@ -3039,15 +3096,12 @@ def main() -> None:
         return
 
     if command == "refinery":
-        import sys as _sys
-        import pathlib as _pathlib
-        # Ensure refinery package is importable (it lives alongside agentstracer)
-        _repo_root = _pathlib.Path(__file__).resolve().parent.parent
-        if str(_repo_root) not in _sys.path:
-            _sys.path.insert(0, str(_repo_root))
-        from refinery.server import run_server as run_refinery
-        run_refinery(port=args.port, open_browser=not args.no_browser)
-        return
+        print(
+            "The refinery UI is not bundled with this package. "
+            "Use `agentstracer serve` for the local workbench.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     if command == "scan":
         _run_scan(source_filter=args.source)
@@ -3187,10 +3241,11 @@ def _handle_config(args) -> None:
     has_changes = (
         args.source
         or args.exclude
+        or args.clear_excludes
         or args.redact
         or args.redact_usernames
         or args.confirm_projects
-        or args.no_secrets_redaction
+        or args.no_secrets_redaction is not None
     )
     if not has_changes:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
@@ -3200,8 +3255,9 @@ def _handle_config(args) -> None:
         exclude=_parse_csv_arg(args.exclude),
         redact=_parse_csv_arg(args.redact),
         redact_usernames=_parse_csv_arg(args.redact_usernames),
-        confirm_projects=args.confirm_projects or bool(args.exclude),
-        no_secrets_redaction=args.no_secrets_redaction if args.no_secrets_redaction else None,
+        confirm_projects=args.confirm_projects or bool(args.exclude) or args.clear_excludes,
+        no_secrets_redaction=args.no_secrets_redaction,
+        clear_excludes=args.clear_excludes,
     )
 
 
@@ -3225,28 +3281,46 @@ def _collect_pii_findings(sessions: list[dict[str, Any]], provider: str, rubric:
     if provider not in ("ai", "claude", "hybrid"):
         raise ValueError(f"Unsupported PII provider: {provider}")
 
-    # Cap AI review sessions — AI calls are expensive
-    cap = limit_sessions if limit_sessions is not None else _PII_AI_SESSION_CAP
-    if len(sessions) > cap:
-        print(f"  AI PII review limited to {cap} sessions (of {len(sessions)}). Use --limit-sessions to override.", file=sys.stderr)
-        sessions = sessions[:cap]
+    if not sessions:
+        return []
 
-    total = len(sessions)
+    # Hybrid means complete deterministic coverage plus a bounded AI pass.
+    # Do not truncate the rule pass along with the expensive AI calls.
+    rule_findings: list[dict[str, Any]] = []
+    if provider == "hybrid":
+        for session in sessions:
+            rule_findings.extend(review_session_pii(session))
+
+    # Cap AI review sessions — AI calls are expensive.
+    cap = max(
+        0,
+        limit_sessions if limit_sessions is not None else _PII_AI_SESSION_CAP,
+    )
+    ai_sessions = sessions[:cap]
+    if len(sessions) > len(ai_sessions):
+        print(f"  AI PII review limited to {cap} sessions (of {len(sessions)}). Use --limit-sessions to override.", file=sys.stderr)
+
+    total = len(ai_sessions)
+    if total == 0:
+        return list(merge_findings(rule_findings))
 
     def _review_one(session: dict[str, Any]) -> list[dict[str, Any]]:
-        if provider in ("ai", "claude"):
-            return review_session_pii_with_agent(session, backend=backend, rubric=rubric)
-        return review_session_pii_hybrid(session, ignore_llm_errors=True, rubric=rubric, backend=backend)
+        return review_session_pii_with_agent(
+            session,
+            backend=backend,
+            rubric=rubric,
+            ignore_errors=provider == "hybrid",
+        )
 
     # Progress counter (thread-safe)
     counter = threading.Lock()
     done_count = 0
 
-    findings = []
+    findings = list(rule_findings)
     workers = min(_PII_SESSION_WORKERS, total)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_sid = {}
-        for session in sessions:
+        for session in ai_sessions:
             sid = str(session.get("session_id") or "?")[:12]
             future_to_sid[pool.submit(_review_one, session)] = sid
 
@@ -3260,7 +3334,7 @@ def _collect_pii_findings(sessions: list[dict[str, Any]], provider: str, rubric:
             except RuntimeError as exc:
                 print(f"  Warning: session {sid} failed: {exc}", file=sys.stderr)
 
-    return findings
+    return list(merge_findings(findings))
 
 
 def _run_pii_review(args) -> None:
@@ -3472,7 +3546,7 @@ def _run_export(args) -> None:
         print(f"  - {p['display_name']} (excluded)")
 
     if not included:
-        print("\nNo projects to export. Run: agentstracer config --exclude ''")
+        print("\nNo projects to export. Run: agentstracer config --clear-excludes")
         sys.exit(1)
 
     # Build anonymizer with extra usernames from config
@@ -3481,6 +3555,7 @@ def _run_export(args) -> None:
 
     # Custom strings to redact
     custom_strings = config.get("redact_strings", [])
+    user_allowlist = config.get("allowlist_entries", [])
 
     if extra_usernames:
         print(f"\nAnonymizing usernames: {', '.join(extra_usernames)}")
@@ -3495,13 +3570,14 @@ def _run_export(args) -> None:
     no_secrets_redaction = config.get("no_secrets_redaction", False)
     if no_secrets_redaction:
         print("\n⚠️  WARNING: Secrets redaction is DISABLED. API keys and tokens will be preserved.")
-        print("   Set 'no_secrets_redaction: false' in config to re-enable.")
+        print("   Run `agentstracer config --secrets-redaction` to re-enable.")
 
     print(f"\nExporting to {output_path}...")
     meta = export_to_jsonl(
         included, output_path, anonymizer, not args.no_thinking,
         custom_strings=custom_strings,
         no_secrets_redaction=no_secrets_redaction,
+        user_allowlist=user_allowlist,
     )
     file_size = output_path.stat().st_size
     print(f"\nExported {meta['sessions']} sessions ({_format_size(file_size)})")
@@ -3541,7 +3617,7 @@ def _run_export(args) -> None:
         "pii_apply": pii_apply_summary,
     }
     config["stage"] = "review"
-    save_config(config)
+    _save_config_checked(config)
 
     print(f"\nDone! JSONL file: {output_path}")
     abs_path = str(output_path.resolve())

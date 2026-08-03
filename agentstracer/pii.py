@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TextIO, TypedDict
 
 from .backends import (
-    BACKEND_CHOICES,
     check_backend_runtime,
     format_codex_runtime_error,
     require_backend_command,
@@ -70,10 +70,36 @@ def load_jsonl_sessions(path: Path) -> list[dict[str, Any]]:
     return sessions
 
 
+def _atomic_private_write(path: Path, writer: Callable[[TextIO], None]) -> None:
+    """Write a sensitive artifact atomically with owner-only permissions."""
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            writer(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def write_jsonl_sessions(path: Path, sessions: Iterable[dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    def write(f: TextIO) -> None:
         for session in sessions:
             f.write(json.dumps(session, ensure_ascii=False) + "\n")
+
+    _atomic_private_write(path, write)
 
 
 def load_findings(path: Path) -> list[PIIFinding]:
@@ -92,8 +118,10 @@ def write_findings(path: Path, findings: list[PIIFinding], meta: dict[str, Any] 
     payload: dict[str, Any] = {"findings": findings}
     if meta:
         payload.update(meta)
-    with open(path, "w", encoding="utf-8") as f:
+    def write(f: TextIO) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    _atomic_private_write(path, write)
 
 
 def normalize_finding(finding: dict[str, Any]) -> PIIFinding:
@@ -105,9 +133,13 @@ def normalize_finding(finding: dict[str, Any]) -> PIIFinding:
         confidence = float(confidence)
     except (TypeError, ValueError):
         confidence = 1.0
+    try:
+        message_index = int(finding.get("message_index") or 0)
+    except (TypeError, ValueError):
+        message_index = 0
     return PIIFinding(
         session_id=str(finding.get("session_id") or ""),
-        message_index=int(finding.get("message_index") or 0),
+        message_index=message_index,
         field=str(finding.get("field") or "content"),
         entity_text=entity_text,
         entity_type=entity_type,
@@ -153,11 +185,16 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     for finding in ordered:
         target = finding.get("entity_text", "")
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
-        if len(target) < 3:
+        if len(target) < 2:
             continue
         escaped = re.escape(target)
-        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
-        result, n = pattern.subn(replacement, result)
+        # ``\w`` includes CJK, which prevents a two-character Chinese name
+        # from matching in normal prose.  Identifier boundaries only need to
+        # protect ASCII word-like entities from substring replacement.
+        left = r"(?<![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", target[0]) else ""
+        right = r"(?![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", target[-1]) else ""
+        pattern = re.compile(rf"{left}{escaped}{right}", re.IGNORECASE)
+        result, n = pattern.subn(lambda _match: replacement, result)
         count += n
     return result, count
 
@@ -178,42 +215,40 @@ def apply_findings_to_session(session: dict[str, Any], findings: list[PIIFinding
     # specific field where it was detected.  PII entities (usernames, names,
     # tokens) typically appear across multiple fields.
 
-    # Apply to top-level metadata fields
-    for meta_field in ("project", "git_branch", "display_title"):
-        value = session.get(meta_field)
+    def apply_value(value: Any, *, protect_session_id: bool = False) -> tuple[Any, int]:
         if isinstance(value, str):
-            new_value, n = apply_findings_to_text(value, session_findings)
-            session[meta_field] = new_value
-            total += n
+            if protect_session_id:
+                return value, 0
+            return apply_findings_to_text(value, session_findings)
+        if isinstance(value, list):
+            out: list[Any] = []
+            count = 0
+            for item in value:
+                redacted, n = apply_value(item)
+                out.append(redacted)
+                count += n
+            return out, count
+        if isinstance(value, dict):
+            out: dict[Any, Any] = {}
+            count = 0
+            for key, nested in value.items():
+                new_key, key_count = apply_value(key)
+                new_value, value_count = apply_value(
+                    nested, protect_session_id=(key == "session_id"),
+                )
+                candidate = new_key
+                suffix = 2
+                while candidate in out:
+                    candidate = f"{new_key}_{suffix}"
+                    suffix += 1
+                out[candidate] = new_value
+                count += key_count + value_count
+            return out, count
+        return value, 0
 
-    messages = session.get("messages", [])
-    if not isinstance(messages, list):
-        return session, 0
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        for field in ("content", "thinking"):
-            value = msg.get(field)
-            if isinstance(value, str):
-                new_value, n = apply_findings_to_text(value, session_findings)
-                msg[field] = new_value
-                total += n
-        for tool_use in msg.get("tool_uses", []):
-            if not isinstance(tool_use, dict):
-                continue
-            for branch in ("input", "output"):
-                value = tool_use.get(branch)
-                if isinstance(value, dict):
-                    for key in list(value.keys()):
-                        if isinstance(value[key], str):
-                            new_value, n = apply_findings_to_text(value[key], session_findings)
-                            value[key] = new_value
-                            total += n
-                elif isinstance(value, str):
-                    new_value, n = apply_findings_to_text(value, session_findings)
-                    tool_use[branch] = new_value
-                    total += n
+    redacted_session, total = apply_value(session)
+    session.clear()
+    session.update(redacted_session)
     return session, total
 
 
@@ -331,12 +366,23 @@ def _normalize_llm_findings(session_id: str, message_index: int, field: str, fin
 
 _PII_PROMPT_FILE = Path(__file__).parent.parent / "prompts" / "pii_reviewer.md"
 
-# Safety valve for session-level batching.  Modern agent CLIs have large
-# context windows (Claude Opus: 1M tokens, Codex/OpenClaw: 200K+).  At ~4
-# chars/token, 2M chars ≈ 500K tokens — half the largest context window,
-# leaving ample room for rubric + reasoning.  In practice this never splits;
-# the largest sessions we've seen are ~120K chars (~30K tokens).
-_BATCH_CHAR_LIMIT = 2_000_000
+# Use a conservative backend-independent batch size.  CJK and source code can
+# consume far more tokens per character than the usual English approximation.
+_BATCH_CHAR_LIMIT = 100_000
+_LLM_CHUNK_OVERLAP = 256
+
+
+def _chunk_for_llm(
+    text: str,
+    max_chars: int = MAX_LLM_TEXT_CHARS,
+    overlap: int = _LLM_CHUNK_OVERLAP,
+) -> list[str]:
+    """Split long fields with overlap so no middle section is skipped."""
+    if len(text) <= max_chars:
+        return [text]
+    overlap = max(0, min(overlap, max_chars - 1))
+    step = max_chars - overlap
+    return [text[start:start + max_chars] for start in range(0, len(text), step)]
 
 
 def _write_batch_inputs(tmp_path: Path, session_id: str, work_items: list[tuple[str, int, str, str]], rubric: str | None) -> None:
@@ -346,7 +392,7 @@ def _write_batch_inputs(tmp_path: Path, session_id: str, work_items: list[tuple[
         lines.append(json.dumps({
             "message_index": message_index,
             "field": field,
-            "text": _truncate_for_llm(text),
+            "text": text,
         }, ensure_ascii=False))
     (tmp_path / "texts_to_review.jsonl").write_text("\n".join(lines), encoding="utf-8")
     (tmp_path / "context.json").write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
@@ -395,9 +441,10 @@ def _read_batch_findings(tmp_path: Path, session_id: str, source: str, stdout: s
 _BATCH_TASK_PROMPT = (
     "Review texts_to_review.jsonl for PII. Each line is a JSON object with "
     "message_index, field, and text. Read PII_RUBRIC.md and context.json. "
-    "Write findings.json with a JSON array. Each finding must include: "
+    "Return only a JSON array in your final response; do not modify any files. "
+    "Each finding must include: "
     "message_index, field, entity_text, entity_type, confidence, reason. "
-    "Write [] if no PII found."
+    "Return [] if no PII is found."
 )
 
 
@@ -407,7 +454,7 @@ def _split_into_batches(work_items: list[tuple[str, int, str, str]], char_limit:
     current: list[tuple[str, int, str, str]] = []
     current_chars = 0
     for item in work_items:
-        item_chars = min(len(item[3]), MAX_LLM_TEXT_CHARS)
+        item_chars = len(item[3])
         if current and current_chars + item_chars > char_limit:
             batches.append(current)
             current = []
@@ -425,7 +472,7 @@ def _review_batch_with_claude(session_id: str, work_items: list[tuple[str, int, 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         _write_batch_inputs(tmp_path, session_id, work_items, rubric)
-        cmd = [command, "-p", "--permission-mode", "bypassPermissions", "--no-session-persistence"]
+        cmd = [command, "-p", "--no-session-persistence"]
         if _PII_PROMPT_FILE.exists():
             cmd += ["--system-prompt-file", str(_PII_PROMPT_FILE)]
         try:
@@ -507,42 +554,77 @@ def _review_text_with_agent(session_id: str, message_index: int, field: str, tex
     runner = _PII_BATCH_RUNNERS.get(resolved)
     if runner is None:
         raise RuntimeError(f"Unsupported PII backend: {resolved}")
-    items = [(session_id, message_index, field, text)]
-    return runner(session_id, items, rubric=rubric)
+    items = [
+        (session_id, message_index, field, chunk)
+        for chunk in _chunk_for_llm(text)
+    ]
+    findings: list[PIIFinding] = []
+    for batch in _split_into_batches(items):
+        findings.extend(runner(session_id, batch, rubric=rubric))
+    return merge_findings(findings)
 
 
 def review_text_with_claude(session_id: str, message_index: int, field: str, text: str, *, timeout_seconds: int = 90, rubric: str | None = None) -> list[PIIFinding]:
     """Backward-compat wrapper — dispatches to Claude backend."""
     if not text.strip():
         return []
-    return _review_batch_with_claude(session_id, [(session_id, 0, field, text)], rubric=rubric, timeout_seconds=timeout_seconds)
+    findings: list[PIIFinding] = []
+    items = [
+        (session_id, message_index, field, chunk)
+        for chunk in _chunk_for_llm(text)
+    ]
+    for batch in _split_into_batches(items):
+        findings.extend(_review_batch_with_claude(
+            session_id, batch, rubric=rubric, timeout_seconds=timeout_seconds,
+        ))
+    return merge_findings(findings)
 
 
 def _collect_text_work_items(session: dict[str, Any]) -> list[tuple[str, int, str, str]]:
     """Extract all (session_id, message_index, field, text) tuples from a session."""
     session_id = str(session.get("session_id") or "")
+    work_items: list[tuple[str, int, str, str]] = []
+
+    def append_text(message_index: int, field: str, text: str) -> None:
+        if not text.strip():
+            return
+        for chunk in _chunk_for_llm(text):
+            work_items.append((session_id, message_index, field, chunk))
+
+    def walk(value: Any, message_index: int, field: str) -> None:
+        if isinstance(value, str):
+            append_text(message_index, field, value)
+        elif isinstance(value, dict):
+            for key, nested in value.items():
+                nested_field = f"{field}.{key}" if field else str(key)
+                if isinstance(key, str):
+                    append_text(message_index, f"{nested_field}.__key__", key)
+                walk(nested, message_index, nested_field)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, message_index, f"{field}[{index}]")
+
+    for meta_field in ("project", "git_branch", "display_title"):
+        value = session.get(meta_field)
+        if isinstance(value, str):
+            append_text(-1, meta_field, value)
+
     messages = session.get("messages", [])
     if not isinstance(messages, list):
-        return []
-    work_items: list[tuple[str, int, str, str]] = []
+        return work_items
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         for field in ("content", "thinking"):
             value = msg.get(field)
             if isinstance(value, str) and value.strip():
-                work_items.append((session_id, i, field, value))
+                append_text(i, field, value)
         for tool_index, tool_use in enumerate(msg.get("tool_uses", [])):
             if not isinstance(tool_use, dict):
                 continue
             for branch in ("input", "output"):
                 value = tool_use.get(branch)
-                if isinstance(value, dict):
-                    for key, nested in value.items():
-                        if isinstance(nested, str) and nested.strip():
-                            work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}.{key}", nested))
-                elif isinstance(value, str) and value.strip():
-                    work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}", value))
+                walk(value, i, f"tool_uses[{tool_index}].{branch}")
     return work_items
 
 
@@ -568,12 +650,13 @@ def review_session_pii_with_agent(session: dict[str, Any], *, backend: str = "au
         # Single batch — no parallelism needed
         try:
             findings.extend(runner(session_id, batches[0], rubric=rubric))
-        except RuntimeError as exc:
+        except RuntimeError:
             if not ignore_errors:
                 raise
     else:
         # Multiple batches — run in parallel
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
+        worker_count = max(1, min(max_workers, len(batches)))
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {pool.submit(runner, session_id, batch, rubric=rubric): batch for batch in batches}
             for future in as_completed(futures):
                 try:
@@ -628,7 +711,7 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
         (r"\b(192\.168\.\d{1,3}\.\d{1,3})\b", "custom_sensitive", "Private IP address (192.168.x)", 0.70, 1),
     ]
     for pattern, entity_type, reason, confidence, group in patterns:
-        for match in re.finditer(pattern, text):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             entity_text = match.group(group).strip()
             if not entity_text or len(entity_text) < 3:
                 continue
@@ -662,6 +745,7 @@ def _metadata_findings_for_text(session_id: str, message_index: int, field: str,
         (rf'{_Q}username{_Q}\s*:\s*{_Q}([^"\\]{{3,}}){_Q}', "username", "Likely username in metadata block", "rule", 0.98),
         (rf'{_Q}sender_id{_Q}\s*:\s*{_Q}([^"\\]{{3,}}){_Q}', "user_id", "Likely sender/user ID in metadata block", "rule", 0.98),
         (rf'{_Q}(?:user_id|chat_id|account_id|sender_id|from_id){_Q}\s*:\s*{_Q}([^"\\]{{3,}}){_Q}', "user_id", "Likely user/chat/account ID in metadata block", "rule", 0.95),
+        (rf'{_Q}(?:user_id|chat_id|account_id|sender_id|from_id|id){_Q}\s*:\s*(\d{{5,}})', "user_id", "Likely unquoted numeric user/chat/account ID", "rule", 0.95),
         (rf'{_Q}id{_Q}\s*:\s*{_Q}(\d{{5,}}){_Q}', "user_id", "Likely numeric user ID in metadata block", "rule", 0.75),
         (rf'{_Q}name{_Q}\s*:\s*{_Q}([^"\\]{{3,}}){_Q}', "person_name", "Likely person name in metadata block", "rule", 0.82),
         (rf'{_Q}sender{_Q}\s*:\s*{_Q}([^"\\]{{3,}}){_Q}', "person_name", "Likely sender name in metadata block", "rule", 0.82),
@@ -697,11 +781,26 @@ def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
     findings: list[PIIFinding] = []
     session_id = str(session.get("session_id") or "")
 
+    def scan_nested(message_index: int, field: str, value: Any) -> None:
+        if isinstance(value, str):
+            findings.extend(_scan_text_for_pii(session_id, message_index, field, value))
+        elif isinstance(value, dict):
+            for key, nested in value.items():
+                nested_field = f"{field}.{key}" if field else str(key)
+                if isinstance(key, str):
+                    findings.extend(_scan_text_for_pii(
+                        session_id, message_index, f"{nested_field}.__key__", key,
+                    ))
+                scan_nested(message_index, nested_field, nested)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                scan_nested(message_index, f"{field}[{index}]", item)
+
     # Scan top-level metadata fields for PII
     for meta_field in ("project", "git_branch", "display_title"):
         value = session.get(meta_field)
         if isinstance(value, str) and value.strip():
-            findings.extend(_content_findings_for_text(session_id, -1, meta_field, value))
+            findings.extend(_scan_text_for_pii(session_id, -1, meta_field, value))
 
     messages = session.get("messages", [])
     if not isinstance(messages, list):
@@ -718,12 +817,5 @@ def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
                 continue
             for branch in ("input", "output"):
                 value = tool_use.get(branch)
-                if isinstance(value, dict):
-                    for key, nested in value.items():
-                        if isinstance(nested, str):
-                            field = f"tool_uses[{tool_index}].{branch}.{key}"
-                            findings.extend(_scan_text_for_pii(session_id, i, field, nested))
-                elif isinstance(value, str):
-                    field = f"tool_uses[{tool_index}].{branch}"
-                    findings.extend(_scan_text_for_pii(session_id, i, field, value))
+                scan_nested(i, f"tool_uses[{tool_index}].{branch}", value)
     return merge_findings(findings)

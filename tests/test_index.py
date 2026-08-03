@@ -1,6 +1,6 @@
 """Tests for the workbench SQLite index."""
 
-import json
+import os
 
 import pytest
 
@@ -18,6 +18,7 @@ from agentstracer.index import (
     search_fts,
     update_session,
     upsert_sessions,
+    _write_blob,
 )
 
 
@@ -74,15 +75,51 @@ class TestUpsertSessions:
 
     def test_upsert_preserves_review_status(self, index_conn):
         upsert_sessions(index_conn, [_make_session()])
-        update_session(index_conn, "sess-1", status="approved")
+        update_session(
+            index_conn, "sess-1", status="approved", notes="reviewed",
+            reason="useful", ai_quality_score=5, ai_score_reason="excellent",
+        )
 
         # Re-index same session
         upsert_sessions(index_conn, [_make_session()])
 
         row = index_conn.execute(
-            "SELECT review_status FROM sessions WHERE session_id = 'sess-1'"
+            "SELECT review_status, reviewer_notes, selection_reason, ai_quality_score, ai_score_reason FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
         assert row["review_status"] == "approved"
+        assert row["reviewer_notes"] == "reviewed"
+        assert row["selection_reason"] == "useful"
+        assert row["ai_quality_score"] == 5
+        assert row["ai_score_reason"] == "excellent"
+
+    def test_changed_content_resets_review_and_unlinks_bundle(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        update_session(index_conn, "sess-1", status="approved", notes="reviewed", ai_quality_score=5)
+        bundle_id = create_bundle(index_conn, ["sess-1"])
+
+        upsert_sessions(index_conn, [_make_session(content="new unreviewed content")])
+
+        row = index_conn.execute(
+            "SELECT review_status, reviewer_notes, ai_quality_score, bundle_id FROM sessions WHERE session_id='sess-1'"
+        ).fetchone()
+        assert dict(row) == {
+            "review_status": "new", "reviewer_notes": None,
+            "ai_quality_score": None, "bundle_id": None,
+        }
+        assert get_bundle(index_conn, bundle_id)["session_count"] == 0
+
+    def test_blob_filename_cannot_escape_storage(self, index_conn, tmp_path):
+        path = _write_blob("../../escaped", _make_session("../../escaped"))
+        assert path.resolve().is_relative_to((tmp_path / "blobs").resolve())
+        assert not (tmp_path / "escaped.json").exists()
+
+    def test_sensitive_index_files_are_private(self, index_conn, tmp_path):
+        upsert_sessions(index_conn, [_make_session()])
+        db_mode = os.stat(tmp_path / "index.db").st_mode & 0o777
+        blob = next((tmp_path / "blobs").glob("*.json"))
+        assert db_mode == 0o600
+        assert os.stat(tmp_path / "blobs").st_mode & 0o777 == 0o700
+        assert os.stat(blob).st_mode & 0o777 == 0o600
 
     def test_skips_session_without_id(self, index_conn):
         session = _make_session()
@@ -136,6 +173,10 @@ class TestQuerySessions:
         assert len(results2) == 3
         assert results[0]["session_id"] != results2[0]["session_id"]
 
+    def test_malformed_fts_text_is_treated_as_literal(self, index_conn):
+        upsert_sessions(index_conn, [_make_session(content='say "hello"')])
+        assert query_sessions(index_conn, search_text='"') == []
+
 
 class TestGetSessionDetail:
     def test_returns_messages(self, index_conn):
@@ -164,6 +205,12 @@ class TestSearchFts:
         results = search_fts(index_conn, "!!! ??? '''")
 
         assert results == []
+
+    def test_indexes_canonical_tool_output(self, index_conn):
+        session = _make_session()
+        session["messages"][1]["tool_uses"][0]["output"] = {"nested": ["unique-output-marker"]}
+        upsert_sessions(index_conn, [session])
+        assert search_fts(index_conn, "unique output marker")[0]["session_id"] == "sess-1"
 
 
 class TestUpdateSession:
@@ -226,6 +273,13 @@ class TestBundles:
         bundle_id = create_bundle(index_conn, ["nonexistent"])
         bundle = get_bundle(index_conn, bundle_id)
         assert bundle["session_count"] == 0
+
+    def test_rebinding_updates_old_bundle_count(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        old_id = create_bundle(index_conn, ["sess-1"])
+        new_id = create_bundle(index_conn, ["sess-1"])
+        assert get_bundle(index_conn, old_id)["session_count"] == 0
+        assert get_bundle(index_conn, new_id)["session_count"] == 1
 
 
 class TestPolicies:

@@ -1,6 +1,6 @@
 """Tests for agentstracer.anonymizer — PII anonymization."""
 
-import pytest
+import agentstracer.anonymizer as anonymizer_module
 
 from agentstracer.anonymizer import (
     Anonymizer,
@@ -24,12 +24,18 @@ class TestHashUsername:
     def test_prefix_format(self):
         result = _hash_username("alice")
         assert result.startswith("user_")
-        assert len(result) == 13  # "user_" + 8 hex chars
+        assert len(result) == 21  # "user_" + 16 hex chars
 
     def test_hex_chars(self):
         result = _hash_username("testuser")
         suffix = result[5:]
         assert all(c in "0123456789abcdef" for c in suffix)
+
+    def test_install_key_prevents_public_dictionary_hashes(self, monkeypatch):
+        monkeypatch.setattr(anonymizer_module, "_ANONYMIZATION_KEY", b"a" * 32)
+        first = _hash_username("alice")
+        monkeypatch.setattr(anonymizer_module, "_ANONYMIZATION_KEY", b"b" * 32)
+        assert _hash_username("alice") != first
 
 
 # --- anonymize_path ---
@@ -80,6 +86,13 @@ class TestAnonymizePath:
             "alice", "user_abc12345", home="/Users/alice",
         )
         assert result == "/var/log/syslog"
+
+    def test_windows_home_path(self):
+        result = anonymize_path(
+            r"C:\Users\Alice\Documents\project\main.py",
+            "alice", "user_abc12345", home=r"C:\Users\alice",
+        )
+        assert result == "project/main.py"
 
     def test_fallback_users_replacement(self):
         # Path with username not matching the prefix set
@@ -144,13 +157,28 @@ class TestAnonymizeText:
         assert "alice" not in result
         assert "user_abc12345" in result
 
-    def test_short_username_not_replaced_bare(self):
-        # Usernames < 4 chars should NOT be replaced as bare words
+    def test_short_username_replaced_bare(self):
         result = anonymize_text(
             "Hello bob, welcome back",
             "bob", "user_abc12345",
         )
-        assert "bob" in result  # bare replacement skipped for short username
+        assert "bob" not in result
+        assert "user_abc12345" in result
+
+    def test_short_username_does_not_replace_substrings(self):
+        result = anonymize_text(
+            "bob uses bobcat",
+            "bob", "user_abc12345",
+        )
+        assert result == "user_abc12345 uses bobcat"
+
+    def test_windows_path_in_text(self):
+        result = anonymize_text(
+            r"File at C:\Users\Alice\project\main.py",
+            "alice", "user_abc12345",
+        )
+        assert "Alice" not in result
+        assert result == r"File at /user_abc12345\project\main.py"
 
     def test_short_username_path_still_replaced(self):
         # Even short usernames should be replaced in path contexts
@@ -197,6 +225,18 @@ class TestAnonymizer:
         anon = Anonymizer(extra_usernames=["testuser", "other"])
         assert len(anon._extra) == 1  # only "other"
 
+    def test_extra_usernames_are_casefold_deduped_and_longest_first(self, monkeypatch):
+        monkeypatch.setattr(
+            "agentstracer.anonymizer._detect_home_dir",
+            lambda: ("/Users/testuser", "testuser"),
+        )
+        anon = Anonymizer(extra_usernames=["dev", "Developer", "DEV"])
+        assert [name for name, _ in anon._extra] == ["Developer", "dev"]
+        result = anon.text("Developer uses dev tools and device APIs")
+        assert "Developer" not in result
+        assert " dev " not in result
+        assert "device" in result
+
 
 # --- _replace_username ---
 
@@ -208,10 +248,9 @@ class TestReplaceUsername:
         assert "Alice" not in result
         assert "user_abc" in result
 
-    def test_short_username_skipped(self):
-        # < 3 chars should be skipped
+    def test_short_username_replaced_with_boundaries(self):
         result = _replace_username("Hello ab and AB", "ab", "user_abc")
-        assert result == "Hello ab and AB"
+        assert result == "Hello user_abc and user_abc"
 
     def test_empty_text(self):
         assert _replace_username("", "alice", "user_abc") == ""

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -177,15 +178,18 @@ def _discover_claude_projects() -> list[dict]:
         if total_count == 0:
             continue
         total_size = sum(f.stat().st_size for f in root_sessions)
+        latest_mtime_ns = max((f.stat().st_mtime_ns for f in root_sessions), default=0)
         for session_dir in subagent_sessions:
             for sa_file in (session_dir / "subagents").glob("agent-*.jsonl"):
                 total_size += sa_file.stat().st_size
+                latest_mtime_ns = max(latest_mtime_ns, sa_file.stat().st_mtime_ns)
         projects.append(
             {
                 "dir_name": project_dir.name,
                 "display_name": _build_project_name(project_dir.name),
                 "session_count": total_count,
                 "total_size_bytes": total_size,
+                "latest_mtime_ns": latest_mtime_ns,
                 "source": CLAUDE_SOURCE,
             }
         )
@@ -204,6 +208,7 @@ def _discover_codex_projects() -> list[dict]:
                 "display_name": _build_codex_project_name(cwd),
                 "session_count": len(session_files),
                 "total_size_bytes": sum(f.stat().st_size for f in session_files),
+                "latest_mtime_ns": max((f.stat().st_mtime_ns for f in session_files), default=0),
                 "source": CODEX_SOURCE,
             }
         )
@@ -265,12 +270,16 @@ def _discover_openclaw_projects() -> list[dict]:
         if not session_files:
             continue
         total_size = sum(f.stat().st_size for f in session_files if f.exists())
+        latest_mtime_ns = max(
+            (f.stat().st_mtime_ns for f in session_files if f.exists()), default=0,
+        )
         projects.append(
             {
                 "dir_name": cwd,
                 "display_name": _build_openclaw_project_name(cwd),
                 "session_count": len(session_files),
                 "total_size_bytes": total_size,
+                "latest_mtime_ns": latest_mtime_ns,
                 "source": OPENCLAW_SOURCE,
             }
         )
@@ -402,6 +411,19 @@ def _parse_custom_sessions(
                     logger.warning(
                         "custom:%s: %s line %d: missing required fields %s, skipping",
                         project_dir_name, jsonl_file.name, line_num, sorted(missing),
+                    )
+                    continue
+                if (
+                    not isinstance(session.get("session_id"), str)
+                    or not session["session_id"].strip()
+                    or not isinstance(session.get("model"), str)
+                    or not session["model"].strip()
+                    or not isinstance(session.get("messages"), list)
+                    or not all(isinstance(msg, dict) for msg in session["messages"])
+                ):
+                    logger.warning(
+                        "custom:%s: %s line %d: invalid field types, skipping",
+                        project_dir_name, jsonl_file.name, line_num,
                     )
                     continue
                 session["project"] = f"custom:{project_dir_name}"
@@ -553,7 +575,9 @@ def _parse_opencode_session(
     stats = _make_stats()
 
     try:
-        with sqlite3.connect(OPENCODE_DB_PATH) as conn:
+        with sqlite3.connect(
+            f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True,
+        ) as conn:
             conn.row_factory = sqlite3.Row
             session_row = conn.execute(
                 "SELECT id, directory, time_created, time_updated FROM session WHERE id = ?",
@@ -794,25 +818,28 @@ def _parse_gemini_tool_call(tc: dict, anonymizer: Anonymizer) -> dict:
     name = tc.get("name")
     args = tc.get("args", {})
     status = tc.get("status", "unknown")
-    result_list = tc.get("result") or []
+    raw_result = tc.get("result")
+    result_list = raw_result if isinstance(raw_result, list) else []
 
     # --- Extract output text from functionResponse ---
-    output_text: str | None = None
+    output_value: Any = None
     extra_texts: list[str] = []
     for item in result_list:
         if not isinstance(item, dict):
             continue
-        if "functionResponse" in item:
-            resp = item["functionResponse"].get("response", {})
-            output_text = resp.get("output")
-        elif "text" in item:
+        function_response = item.get("functionResponse")
+        if isinstance(function_response, dict):
+            response = function_response.get("response", {})
+            if isinstance(response, dict) and "output" in response:
+                output_value = response["output"]
+        elif isinstance(item.get("text"), str):
             extra_texts.append(item["text"])
 
     # --- Build structured input (reuses generic field classification) ---
     inp = _parse_tool_input(name, args, anonymizer)
 
     # --- Build structured output ---
-    if name == "read_many_files":
+    if name == "read_many_files" and extra_texts:
         # Parse "--- /path/to/file ---\n<content>" blocks from extra text parts
         files: list[dict] = []
         for raw in extra_texts:
@@ -836,12 +863,12 @@ def _parse_gemini_tool_call(tc: dict, anonymizer: Anonymizer) -> dict:
                     "content": anonymizer.text("\n".join(content_lines).strip()),
                 })
         out: dict = {"files": files}
-    elif name == "run_shell_command" and output_text:
+    elif name == "run_shell_command" and isinstance(output_value, str) and output_value:
         # Parse "Command: ...\nDirectory: ...\nOutput: ...\nExit Code: ..." format
         parsed: dict = {}
         current_key: str | None = None
         current_val: list[str] = []
-        for line in output_text.splitlines():
+        for line in output_value.splitlines():
             for key, prefix in (("command", "Command: "), ("directory", "Directory: "),
                                  ("output", "Output: "), ("exit_code", "Exit Code: ")):
                 if line.startswith(prefix):
@@ -867,8 +894,14 @@ def _parse_gemini_tool_call(tc: dict, anonymizer: Anonymizer) -> dict:
         if "output" in parsed:
             parsed["output"] = anonymizer.text(parsed["output"])
         out = parsed
-    elif output_text is not None:
-        out = {"text": anonymizer.text(output_text)}
+    elif output_value is not None:
+        out = _normalize_structured_output(output_value, anonymizer)
+    elif not isinstance(raw_result, list):
+        out = _normalize_structured_output(raw_result, anonymizer)
+    elif raw_result:
+        # Unknown result blocks are still valuable evidence.  Preserve their
+        # shape rather than silently reducing them to an empty object.
+        out = {"result": _anonymize_structured_value(raw_result, anonymizer)}
     else:
         out = {}
 
@@ -924,9 +957,10 @@ def _parse_gemini_session_file(
                 metadata["model"] = msg_data.get("model")
 
             tokens = msg_data.get("tokens", {})
-            if tokens:
-                stats["input_tokens"] += tokens.get("input", 0) + tokens.get("cached", 0)
-                stats["output_tokens"] += tokens.get("output", 0)
+            if isinstance(tokens, dict):
+                stats["input_tokens"] += _safe_int(tokens.get("input"))
+                stats["input_tokens"] += _safe_int(tokens.get("cached"))
+                stats["output_tokens"] += _safe_int(tokens.get("output"))
 
             msg = {"role": "assistant"}
             if timestamp:
@@ -962,6 +996,26 @@ def _parse_gemini_session_file(
     return _make_session_result(metadata, messages, stats)
 
 
+def _openclaw_session_identity(filepath: Path, native_id: str) -> tuple[str, str]:
+    """Return a collision-free session ID and lifecycle status for a log file.
+
+    OpenClaw keeps reset/deleted snapshots beside the active ``.jsonl`` file,
+    and each snapshot repeats the same native header ID.  Keep the active ID
+    backwards compatible while giving every archived file a deterministic ID.
+    """
+    filename = filepath.name
+    if ".jsonl.deleted." in filename:
+        status = "deleted"
+    elif ".jsonl.reset." in filename:
+        status = "reset"
+    else:
+        return native_id, "active"
+
+    agent_name = filepath.parent.parent.name if filepath.parent.name == "sessions" else filepath.parent.name
+    digest = hashlib.sha256(f"{agent_name}/{filename}".encode()).hexdigest()[:12]
+    return f"{native_id}::{status}::{digest}", status
+
+
 def _parse_openclaw_session_file(
     filepath: Path, anonymizer: Anonymizer, include_thinking: bool = True
 ) -> dict | None:
@@ -979,18 +1033,12 @@ def _parse_openclaw_session_file(
     if header.get("type") != "session":
         return None
 
-    # Determine session status from filename suffix
-    # active: .jsonl, reset: .jsonl.reset.<timestamp>, deleted: .jsonl.deleted.<timestamp>
-    filename = filepath.name
-    if ".jsonl.deleted." in filename:
-        session_status = "deleted"
-    elif ".jsonl.reset." in filename:
-        session_status = "reset"
-    else:
-        session_status = "active"
+    native_session_id = str(header.get("id") or filepath.name.split(".jsonl", 1)[0])
+    session_id, session_status = _openclaw_session_identity(filepath, native_session_id)
 
     metadata: dict[str, Any] = {
-        "session_id": header.get("id", filepath.stem),
+        "session_id": session_id,
+        "native_session_id": native_session_id,
         "cwd": None,
         "git_branch": None,
         "model": None,
@@ -1202,7 +1250,9 @@ class _CodexParseState:
     max_input_tokens: int = 0
     max_output_tokens: int = 0
     tool_result_map: dict[str, dict] = dataclasses.field(default_factory=dict)
-    use_response_messages: bool = False
+    response_message_skip_counts: Counter[tuple[str, str]] = dataclasses.field(
+        default_factory=Counter
+    )
 
 
 def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
@@ -1300,11 +1350,17 @@ def _parse_codex_session_file(
         return None
 
     state.tool_result_map = _build_codex_tool_result_map(entries, anonymizer)
-    state.use_response_messages = not any(
-        entry.get("type") == "event_msg"
-        and entry.get("payload", {}).get("type") in ("user_message", "agent_message")
-        for entry in entries
-    )
+    for entry in entries:
+        if entry.get("type") != "event_msg":
+            continue
+        payload = entry.get("payload", {})
+        event_role = {
+            "user_message": "user",
+            "agent_message": "assistant",
+        }.get(payload.get("type"))
+        event_text = payload.get("message")
+        if event_role and isinstance(event_text, str) and event_text.strip():
+            state.response_message_skip_counts[(event_role, event_text.strip())] += 1
 
     for entry in entries:
         timestamp = _normalize_timestamp(entry.get("timestamp"))
@@ -1423,21 +1479,14 @@ def _handle_codex_response_item(
                 if cleaned not in state._pending_thinking_seen:
                     state._pending_thinking_seen.add(cleaned)
                     state.pending_thinking.append(cleaned)
-    elif item_type == "message" and state.use_response_messages:
+    elif item_type == "message":
         role = payload.get("role")
-        content = payload.get("content", [])
-        text_parts = []
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                text = block.get("text")
-                if isinstance(text, str) and text.strip():
-                    text_parts.append(text.strip())
-        text = "\n\n".join(text_parts).strip()
+        text = _extract_codex_response_message_text(payload.get("content"))
         if not text:
+            return
+        fingerprint = (str(role), text)
+        if state.response_message_skip_counts[fingerprint] > 0:
+            state.response_message_skip_counts[fingerprint] -= 1
             return
         if role == "user":
             _flush_codex_pending(state, timestamp)
@@ -1465,6 +1514,20 @@ def _handle_codex_response_item(
             state.pending_tool_uses.clear()
             state.pending_thinking.clear()
             state._pending_thinking_seen.clear()
+
+
+def _extract_codex_response_message_text(content: Any) -> str:
+    text_parts: list[str] = []
+    if isinstance(content, str):
+        text_parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text.strip())
+    return "\n\n".join(text_parts).strip()
 
 
 def _handle_codex_token_count(state: _CodexParseState, payload: dict[str, Any]) -> None:
@@ -1576,9 +1639,47 @@ def _update_time_bounds(metadata: dict[str, Any], timestamp: str | None) -> None
 
 
 def _safe_int(value: Any) -> int:
-    if isinstance(value, (int, float)):
-        return int(value)
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError:
+                return int(float(value.strip()))
+    except (OverflowError, ValueError):
+        return 0
     return 0
+
+
+def _anonymize_structured_value(value: Any, anonymizer: Anonymizer) -> Any:
+    """Recursively redact strings while retaining a structured payload."""
+    if isinstance(value, str):
+        return anonymizer.text(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _anonymize_structured_value(item, anonymizer)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_anonymize_structured_value(item, anonymizer) for item in value]
+    return value
+
+
+def _normalize_structured_output(value: Any, anonymizer: Anonymizer) -> dict[str, Any]:
+    """Keep tool output lossless while satisfying the parser's dict schema."""
+    redacted = _anonymize_structured_value(value, anonymizer)
+    if isinstance(redacted, dict):
+        return redacted
+    if isinstance(redacted, str):
+        return {"text": redacted}
+    if redacted is None:
+        return {}
+    return {"value": redacted}
 
 
 def _load_json_field(value: Any) -> dict[str, Any]:
@@ -1656,10 +1757,8 @@ def _extract_opencode_assistant_content(
                 if isinstance(status, str):
                     tu["status"] = "success" if status == "completed" else status
                 output = state.get("output")
-                if isinstance(output, str) and output:
-                    tu["output"] = {"text": anonymizer.text(output)}
-                elif output is not None:
-                    tu["output"] = {}
+                if output is not None:
+                    tu["output"] = _normalize_structured_output(output, anonymizer)
             tool_uses.append(tu)
 
     if not text_parts and not thinking_parts and not tool_uses:
@@ -1831,6 +1930,32 @@ def _parse_kimi_session_file(
 
     current_step: dict[str, Any] | None = None
 
+    def flush_current_step(timestamp: str | None = None) -> None:
+        nonlocal current_step
+        if current_step is None:
+            return
+
+        assistant_msg: dict[str, Any] = {"role": "assistant"}
+        if current_step["text_parts"]:
+            assistant_msg["content"] = "\n\n".join(current_step["text_parts"])
+        if current_step["thinking_parts"]:
+            assistant_msg["thinking"] = "\n\n".join(current_step["thinking_parts"])
+        if current_step["tool_uses"]:
+            assistant_msg["tool_uses"] = current_step["tool_uses"]
+
+        effective_timestamp = (
+            timestamp
+            or current_step.get("last_timestamp")
+            or current_step.get("timestamp")
+        )
+        if len(assistant_msg) > 1:
+            assistant_msg["timestamp"] = effective_timestamp
+            messages.append(assistant_msg)
+            stats["assistant_messages"] += 1
+            stats["tool_uses"] += len(assistant_msg.get("tool_uses", []))
+            _update_time_bounds(metadata, effective_timestamp)
+        current_step = None
+
     try:
         for entry in _iter_jsonl(wire_file):
             event_type = entry.get("type")
@@ -1842,9 +1967,10 @@ def _parse_kimi_session_file(
 
             if event_type == "usage.record":
                 usage = entry.get("usage", {})
-                stats["input_tokens"] += _safe_int(usage.get("inputOther"))
-                stats["input_tokens"] += _safe_int(usage.get("inputCacheRead"))
-                stats["output_tokens"] += _safe_int(usage.get("output"))
+                if isinstance(usage, dict):
+                    stats["input_tokens"] += _safe_int(usage.get("inputOther"))
+                    stats["input_tokens"] += _safe_int(usage.get("inputCacheRead"))
+                    stats["output_tokens"] += _safe_int(usage.get("output"))
                 continue
 
             if event_type == "context.append_message":
@@ -1905,6 +2031,7 @@ def _parse_kimi_session_file(
                         stats["tool_uses"] += len(tool_uses)
 
                     if text_parts or thinking_parts or tool_uses:
+                        assistant_msg["timestamp"] = timestamp
                         messages.append(assistant_msg)
                         stats["assistant_messages"] += 1
                         _update_time_bounds(metadata, timestamp)
@@ -1919,14 +2046,17 @@ def _parse_kimi_session_file(
                 timestamp = _normalize_timestamp(entry.get("time"))
 
                 if sub_type == "step.begin":
+                    flush_current_step()
                     current_step = {
                         "text_parts": [],
                         "thinking_parts": [],
                         "tool_uses": [],
                         "timestamp": timestamp,
+                        "last_timestamp": timestamp,
                     }
 
                 elif sub_type == "content.part" and current_step is not None:
+                    current_step["last_timestamp"] = timestamp or current_step.get("last_timestamp")
                     part = event.get("part", {})
                     if not isinstance(part, dict):
                         pass
@@ -1940,6 +2070,7 @@ def _parse_kimi_session_file(
                             current_step["thinking_parts"].append(anonymizer.text(think))
 
                 elif sub_type == "tool.call" and current_step is not None:
+                    current_step["last_timestamp"] = timestamp or current_step.get("last_timestamp")
                     args = event.get("args", {})
                     tool_use = _build_kimi_tool_use(
                         event.get("name"),
@@ -1950,9 +2081,10 @@ def _parse_kimi_session_file(
                     current_step["tool_uses"].append(tool_use)
 
                 elif sub_type == "tool.result" and current_step is not None:
+                    current_step["last_timestamp"] = timestamp or current_step.get("last_timestamp")
                     tool_call_id = event.get("toolCallId")
                     result = event.get("result", {})
-                    output = result.get("output", "")
+                    output = result.get("output", "") if isinstance(result, dict) else result
                     for tu in current_step["tool_uses"]:
                         if tu.get("id") == tool_call_id:
                             tu["output"] = anonymizer.text(str(output)) if isinstance(output, str) else output
@@ -1960,27 +2092,14 @@ def _parse_kimi_session_file(
                             break
 
                 elif sub_type == "step.end" and current_step is not None:
-                    assistant_msg = {"role": "assistant"}
-                    if current_step["text_parts"]:
-                        assistant_msg["content"] = "\n\n".join(current_step["text_parts"])
-                    if current_step["thinking_parts"]:
-                        assistant_msg["thinking"] = "\n\n".join(current_step["thinking_parts"])
-                    if current_step["tool_uses"]:
-                        assistant_msg["tool_uses"] = current_step["tool_uses"]
-                        stats["tool_uses"] += len(current_step["tool_uses"])
-
-                    if (
-                        current_step["text_parts"]
-                        or current_step["thinking_parts"]
-                        or current_step["tool_uses"]
-                    ):
-                        messages.append(assistant_msg)
-                        stats["assistant_messages"] += 1
-                        _update_time_bounds(metadata, current_step["timestamp"])
-                    current_step = None
+                    current_step["last_timestamp"] = timestamp or current_step.get("last_timestamp")
+                    flush_current_step(timestamp)
 
     except OSError:
         return None
+
+    # Interrupted streams often omit step.end; retain the useful partial step.
+    flush_current_step()
 
     return _make_session_result(metadata, messages, stats)
 
@@ -1991,7 +2110,9 @@ def _build_opencode_project_index() -> dict[str, list[str]]:
 
     index: dict[str, list[str]] = {}
     try:
-        with sqlite3.connect(OPENCODE_DB_PATH) as conn:
+        with sqlite3.connect(
+            f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True,
+        ) as conn:
             rows = conn.execute(
                 "SELECT id, directory FROM session ORDER BY time_updated DESC, id DESC"
             ).fetchall()
@@ -2094,8 +2215,16 @@ def _process_entry(
             if metadata["model"] is None:
                 metadata["model"] = entry.get("message", {}).get("model")
             usage = entry.get("message", {}).get("usage", {})
-            stats["input_tokens"] += usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-            stats["output_tokens"] += usage.get("output_tokens", 0)
+            if isinstance(usage, dict):
+                message_usage = {
+                    "input_tokens": _safe_int(usage.get("input_tokens")),
+                    "cache_read_input_tokens": _safe_int(usage.get("cache_read_input_tokens")),
+                    "output_tokens": _safe_int(usage.get("output_tokens")),
+                }
+                stats["input_tokens"] += message_usage["input_tokens"]
+                stats["input_tokens"] += message_usage["cache_read_input_tokens"]
+                stats["output_tokens"] += message_usage["output_tokens"]
+                msg["usage"] = message_usage
             stats["tool_uses"] += len(msg.get("tool_uses", []))
             msg["timestamp"] = timestamp
             messages.append(msg)

@@ -8,6 +8,7 @@ to the corresponding automation CLI.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -60,14 +61,38 @@ def _get_process_field(pid: int, field: str) -> str:
 
 def _classify_process_command(comm: str, command: str) -> str | None:
     """Map a process command to a supported backend."""
-    fields = " ".join(part for part in (comm, command) if part).lower()
-    if not fields:
-        return None
     base = Path(comm).name.lower() if comm else ""
     for backend, aliases in BACKEND_COMMAND_ALIASES.items():
-        for alias in aliases:
-            if base == alias or f" {alias}" in f" {fields}" or f"/{alias}" in fields:
-                return backend
+        if base in aliases:
+            return backend
+
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    if not argv:
+        return None
+
+    candidates = [Path(argv[0]).name.lower()]
+    # A CLI may be launched through a language/shell interpreter.  Only the
+    # executable/script position is considered; arbitrary arguments containing
+    # words like "codex" must not select a backend.
+    interpreters = {
+        "bash", "sh", "zsh", "fish", "node", "nodejs",
+        "python", "python3", "ruby", "env",
+    }
+    if candidates[0] in interpreters:
+        for arg in argv[1:]:
+            if candidates[0] == "env" and "=" in arg and not arg.startswith(("/", ".")):
+                continue
+            if arg.startswith("-"):
+                continue
+            candidates.append(Path(arg).name.lower())
+            break
+
+    for backend, aliases in BACKEND_COMMAND_ALIASES.items():
+        if any(candidate in aliases for candidate in candidates):
+            return backend
     return None
 
 
@@ -137,10 +162,16 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
 
 def require_backend_command(backend: str) -> str:
     """Return the CLI command for a backend, ensuring it is installed."""
-    command = BACKEND_COMMANDS[backend]
-    if shutil.which(command) is None:
+    try:
+        command = BACKEND_COMMANDS[backend]
+    except KeyError as exc:
+        raise RuntimeError(f"Unsupported backend: {backend}") from exc
+    resolved = shutil.which(command)
+    if resolved is None:
         raise RuntimeError(f"{backend} CLI not found. Install it or choose a different --backend.")
-    return command
+    # Use the path that was actually checked instead of resolving PATH again at
+    # subprocess launch time.
+    return resolved
 
 
 def check_backend_runtime(backend: str, env: dict[str, str] | None = None) -> None:

@@ -24,6 +24,7 @@ from .parser import (
     OPENCODE_DB_PATH,
     OPENCLAW_AGENTS_DIR,
     PROJECTS_DIR,
+    _openclaw_session_identity,
 )
 from .trace_model import (
     AgentTrace,
@@ -108,27 +109,44 @@ def _entry_id(prefix: str, entry: dict[str, Any]) -> str:
 def _usage(value: Any, *, claude: bool = False) -> dict[str, int | float]:
     if not isinstance(value, dict):
         return {}
+
+    def safe_int(raw: Any) -> int:
+        if raw is None or isinstance(raw, bool):
+            return 0
+        try:
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if not raw:
+                    return 0
+                try:
+                    return int(raw)
+                except ValueError:
+                    return int(float(raw))
+            return int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
     if claude:
         result = {
-            "input": int(value.get("input_tokens") or 0),
-            "output": int(value.get("output_tokens") or 0),
-            "cache_read": int(value.get("cache_read_input_tokens") or 0),
-            "cache_write": int(value.get("cache_creation_input_tokens") or 0),
+            "input": safe_int(value.get("input_tokens")),
+            "output": safe_int(value.get("output_tokens")),
+            "cache_read": safe_int(value.get("cache_read_input_tokens")),
+            "cache_write": safe_int(value.get("cache_creation_input_tokens")),
         }
     else:
         cache = value.get("cache") if isinstance(value.get("cache"), dict) else {}
         result = {
-            "input": int(value.get("input") or value.get("input_tokens") or 0),
-            "output": int(value.get("output") or value.get("output_tokens") or 0),
-            "cache_read": int(
+            "input": safe_int(value.get("input") or value.get("input_tokens")),
+            "output": safe_int(value.get("output") or value.get("output_tokens")),
+            "cache_read": safe_int(
                 value.get("cacheRead") or value.get("cached_input_tokens") or
-                cache.get("read") or 0
+                cache.get("read")
             ),
-            "cache_write": int(
+            "cache_write": safe_int(
                 value.get("cacheWrite") or value.get("cache_write_input_tokens") or
-                cache.get("write") or 0
+                cache.get("write")
             ),
-            "reasoning": int(value.get("reasoning_output_tokens") or 0),
+            "reasoning": safe_int(value.get("reasoning_output_tokens")),
         }
     return {key: val for key, val in result.items() if val}
 
@@ -3805,24 +3823,46 @@ def _openclaw_raw_observations(
 
 
 def iter_openclaw_traces(include_thinking: bool = True) -> Iterator[AgentTrace]:
-    trajectories: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    trajectory_paths: dict[str, Path] = {}
+    trajectory_candidates: dict[str, list[Path]] = defaultdict(list)
     if OPENCLAW_AGENTS_DIR.exists():
         for path in sorted(OPENCLAW_AGENTS_DIR.rglob("*.trajectory.jsonl*")):
-            for entry in _jsonl(path):
-                trace_id = entry.get("traceId")
-                if trace_id:
-                    key = str(trace_id)
-                    trajectories[key].append(entry)
-                    # Prefer the active file over a deleted archival copy.
-                    if key not in trajectory_paths or ".deleted." in trajectory_paths[key].name:
-                        trajectory_paths[key] = path
+            entries = _jsonl(path)
+            for trace_id in {
+                str(entry["traceId"])
+                for entry in entries
+                if entry.get("traceId")
+            }:
+                trajectory_candidates[trace_id].append(path)
 
-    raw_by_id: dict[str, tuple[Path, list[dict[str, Any]]]] = {}
+    # A trajectory may have active and archived copies.  Read only the best
+    # copy so stale deleted events cannot overwrite newer active events.
+    trajectory_paths: dict[str, Path] = {}
+    trajectories: dict[str, list[dict[str, Any]]] = {}
+    for trace_id, paths in trajectory_candidates.items():
+        selected = min(
+            paths,
+            key=lambda path: (
+                1 if ".jsonl.reset." in path.name else 2 if ".jsonl.deleted." in path.name else 0,
+                path.name,
+            ),
+        )
+        trajectory_paths[trace_id] = selected
+        trajectories[trace_id] = [
+            entry for entry in _jsonl(selected)
+            if str(entry.get("traceId")) == trace_id
+        ]
+
+    raw_records: dict[str, tuple[Path, list[dict[str, Any]], str, str]] = {}
+    raw_by_filename: dict[str, str] = {}
+    raw_by_native: dict[str, list[str]] = defaultdict(list)
     for path in _openclaw_session_files():
         entries = _jsonl(path)
         if entries and entries[0].get("type") == "session":
-            raw_by_id[str(entries[0].get("id") or path.name.split(".jsonl", 1)[0])] = (path, entries)
+            native_id = str(entries[0].get("id") or path.name.split(".jsonl", 1)[0])
+            session_id, session_status = _openclaw_session_identity(path, native_id)
+            raw_records[session_id] = (path, entries, native_id, session_status)
+            raw_by_filename[path.name] = session_id
+            raw_by_native[native_id].append(session_id)
 
     used_raw: set[str] = set()
     for native_trace_id, raw_events in trajectories.items():
@@ -3840,13 +3880,24 @@ def iter_openclaw_traces(include_thinking: bool = True) -> Iterator[AgentTrace]:
         start_data = started.get("data") if isinstance(started.get("data"), dict) else {}
         session_file = start_data.get("sessionFile")
         raw_id = Path(session_file).name.split(".jsonl", 1)[0] if isinstance(session_file, str) else None
-        raw = raw_by_id.get(str(raw_id)) if raw_id else None
+        raw_key = raw_by_filename.get(Path(session_file).name) if isinstance(session_file, str) else None
+        if raw_key is None and raw_id:
+            candidates = raw_by_native.get(str(raw_id), [])
+            if candidates:
+                raw_key = min(
+                    candidates,
+                    key=lambda key: (
+                        0 if raw_records[key][3] == "active" else 1,
+                        raw_records[key][0].name,
+                    ),
+                )
+        raw = raw_records.get(raw_key) if raw_key else None
         root_logical = "root-agent"
         observations: list[TraceObservation] = []
         trace_input: Any = None
         trace_output: Any = None
         if raw:
-            used_raw.add(str(raw_id))
+            used_raw.add(str(raw_key))
             children, trace_input, trace_output = _openclaw_raw_observations(raw[1], root_logical, include_thinking)
             observations.extend(children)
             if children:
@@ -3882,7 +3933,7 @@ def iter_openclaw_traces(include_thinking: bool = True) -> Iterator[AgentTrace]:
                 "timestamp_quality": "trajectory_exact",
             },
         )
-        session_id = str(raw_id or started.get("sessionId") or native_trace_id)
+        session_id = str(raw_key or raw_id or started.get("sessionId") or native_trace_id)
         yield AgentTrace(
             logical_id=f"openclaw:{native_trace_id}",
             name="openclaw-agent-run",
@@ -3895,8 +3946,8 @@ def iter_openclaw_traces(include_thinking: bool = True) -> Iterator[AgentTrace]:
 
     # Older sessions may have no trajectory companion; preserve them through
     # a raw-session fallback instead of silently dropping them.
-    for raw_id, (path, entries) in raw_by_id.items():
-        if raw_id in used_raw:
+    for session_id, (path, entries, native_id, session_status) in raw_records.items():
+        if session_id in used_raw:
             continue
         times = [timestamp_ns(e.get("timestamp")) for e in entries]
         start, end = bounds(times, file_mtime_ns(path))
@@ -3905,15 +3956,19 @@ def iter_openclaw_traces(include_thinking: bool = True) -> Iterator[AgentTrace]:
             end = max(end, max(child.end_ns for child in children))
         header = entries[0]
         yield AgentTrace(
-            logical_id=f"openclaw-raw:{raw_id}",
+            logical_id=f"openclaw-raw:{session_id}",
             name="openclaw-agent-session",
             source="openclaw",
-            source_session_id=raw_id,
+            source_session_id=session_id,
             project=str(header.get("cwd") or "openclaw"),
             observations=[TraceObservation(
                 logical_id="root-agent", name="run-openclaw-agent", as_type="agent",
                 start_ns=start, end_ns=end, input=trace_input, output=trace_output,
-                metadata={"timestamp_quality": "message_exact", "session_status": "raw-only"},
+                metadata={
+                    "timestamp_quality": "message_exact",
+                    "session_status": session_status,
+                    "native_session_id": native_id,
+                },
             ), *children],
             metadata={"adapter": "openclaw-raw-v2"},
         )

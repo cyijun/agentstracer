@@ -83,6 +83,9 @@ class TestParseTestOutcome:
     def test_pytest_mixed(self):
         assert _parse_test_outcome("3 passed, 1 failed") == "3/4 passed"
 
+    def test_pytest_failure_first_and_errors(self):
+        assert _parse_test_outcome("2 failed, 3 passed, 1 error") == "3/6 passed"
+
     def test_no_output(self):
         assert _parse_test_outcome("") is None
 
@@ -221,6 +224,14 @@ class TestExtractWorkflowSteps:
         ]
         steps = extract_workflow_steps(messages)
         assert len(steps) == 2
+
+    def test_missing_tool_name_is_safe(self):
+        messages = [{
+            "role": "assistant",
+            "tool_uses": [{"tool": None, "input": "unexpected", "output": "ok"}],
+        }]
+        steps = extract_workflow_steps(messages)
+        assert steps[0]["tool"] == "unknown"
 
 
 class TestFormatWorkflowStep:

@@ -8,7 +8,9 @@ from agentstracer.anonymizer import Anonymizer
 from agentstracer.trace_model import (
     AgentTrace,
     TraceObservation,
+    ns_to_iso,
     sanitize_trace,
+    sanitize_value,
     timestamp_ns,
 )
 
@@ -42,6 +44,14 @@ def _trace(observations=None):
 )
 def test_timestamp_ns_supports_agent_encodings(value, expected):
     assert timestamp_ns(value) == expected
+
+
+def test_timestamp_ns_preserves_nanosecond_precision():
+    exact = 1_700_000_000_123_456_789
+    assert timestamp_ns(exact) == exact
+    assert timestamp_ns(str(exact)) == exact
+    assert timestamp_ns("2023-11-14T22:13:20.123456789Z") == exact
+    assert ns_to_iso(exact) == "2023-11-14T22:13:20.123456789+00:00"
 
 
 def test_finalize_repairs_missing_parent_and_is_deterministic():
@@ -99,3 +109,61 @@ def test_sanitize_trace_redacts_nested_secrets_and_paths():
     assert "sensitive.person@corp.com" not in encoded
     assert "work" not in encoded
     assert trace.trace_id is not None
+
+
+def test_sanitize_value_redacts_dict_keys_without_losing_collisions():
+    value = {
+        "alice": "first",
+        "bob": "second",
+    }
+    sanitized = sanitize_value(
+        value,
+        anonymizer=Anonymizer(),
+        custom_strings=("alice", "bob"),
+    )
+    assert len(sanitized) == 2
+    assert set(sanitized.values()) == {"first", "second"}
+    encoded = str(sanitized)
+    assert "alice" not in encoded
+    assert "bob" not in encoded
+    assert any("__redacted_" in key for key in sanitized)
+
+
+def test_sanitize_trace_covers_identifiers_tags_and_relationships():
+    trace = AgentTrace(
+        logical_id="trace:/Users/alice/private",
+        name="run alice",
+        source="custom-alice",
+        source_session_id="alice@example.com",
+        session_id="session-alice",
+        environment="alice-laptop",
+        tags=["owner:alice"],
+        metadata={"alice@example.com": "alice"},
+        observations=[
+            TraceObservation("root:alice", "root", "agent", 1, 3),
+            TraceObservation(
+                "child:alice", "child", "tool", 2, 3, "root:alice",
+            ),
+        ],
+    )
+    sanitize_trace(trace, anonymizer=Anonymizer(extra_usernames=["alice"]))
+    encoded = str(trace)
+    assert "alice" not in encoded.lower()
+    assert trace.observations[1].parent_logical_id == trace.observations[0].logical_id
+
+
+@pytest.mark.parametrize("field", ["name", "project", "metadata", "tags", "environment", "session_id"])
+def test_finalize_fingerprint_covers_uploaded_trace_fields(field):
+    trace = _trace().finalize()
+    original_trace_id = trace.trace_id
+    values = {
+        "name": "changed name",
+        "project": "changed project",
+        "metadata": {"changed": True},
+        "tags": ["changed"],
+        "environment": "changed environment",
+        "session_id": "changed session",
+    }
+    setattr(trace, field, values[field])
+    trace.finalize()
+    assert trace.trace_id != original_trace_id

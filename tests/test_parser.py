@@ -14,6 +14,9 @@ from agentstracer.parser import (
     _extract_user_content,
     _find_subagent_only_sessions,
     _normalize_timestamp,
+    _extract_opencode_assistant_content,
+    _parse_gemini_tool_call,
+    _parse_kimi_session_file,
     _parse_session_file,
     _parse_subagent_session,
     _parse_tool_input,
@@ -765,7 +768,7 @@ class TestDiscoverProjects:
                 "payload": {"type": "agent_message", "message": "I found the issue."},
             },
         ]
-        session_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+        session_file.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
 
         monkeypatch.setattr("agentstracer.parser.CODEX_SESSIONS_DIR", tmp_path / "codex-sessions")
         monkeypatch.setattr("agentstracer.parser.CODEX_ARCHIVED_DIR", tmp_path / "codex-archived")
@@ -885,6 +888,44 @@ class TestDiscoverProjects:
         assert sessions[0]["messages"][0]["role"] == "user"
         assert sessions[0]["messages"][1]["role"] == "assistant"
         assert sessions[0]["messages"][1]["tool_uses"][0]["tool"] == "bash"
+
+
+def test_opencode_structured_tool_output_is_preserved(mock_anonymizer):
+    message = _extract_opencode_assistant_content(
+        [{
+            "type": "tool",
+            "tool": "inspect",
+            "state": {
+                "status": "completed",
+                "input": {},
+                "output": {"value": 42, "nested": ["secret", {"ok": True}]},
+            },
+        }],
+        mock_anonymizer,
+        include_thinking=True,
+    )
+
+    assert message["tool_uses"][0]["output"] == {
+        "value": 42,
+        "nested": ["secret", {"ok": True}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_result", "expected"),
+    [
+        ("plain output", {"text": "plain output"}),
+        ({"answer": "structured", "count": 2}, {"answer": "structured", "count": 2}),
+        (7, {"value": 7}),
+    ],
+)
+def test_gemini_non_list_tool_results_are_preserved(raw_result, expected, mock_anonymizer):
+    parsed = _parse_gemini_tool_call(
+        {"name": "custom", "args": {}, "status": "success", "result": raw_result},
+        mock_anonymizer,
+    )
+
+    assert parsed["output"] == expected
 
 
 # --- Subagent-only session discovery and parsing ---
@@ -1408,7 +1449,7 @@ class TestBuildCodexToolResultMap:
                 "payload": {"type": "agent_message", "message": "Done."},
             },
         ]
-        session_file.write_text("\n".join(_json.dumps(l) for l in lines) + "\n")
+        session_file.write_text("\n".join(_json.dumps(line) for line in lines) + "\n")
 
         monkeypatch.setattr("agentstracer.parser.CODEX_SESSIONS_DIR", tmp_path / "codex-sessions")
         monkeypatch.setattr("agentstracer.parser.CODEX_ARCHIVED_DIR", tmp_path / "codex-archived")
@@ -1446,6 +1487,57 @@ class TestBuildCodexToolResultMap:
         assert result is not None
         assert [(message["role"], message["content"]) for message in result["messages"]] == [
             ("user", "hello"), ("assistant", "hi"),
+        ]
+
+    def test_mixed_event_and_response_messages_are_counted_without_loss(
+        self, tmp_path, mock_anonymizer,
+    ):
+        session_file = tmp_path / "mixed.jsonl"
+        entries = [
+            {"timestamp": "2026-02-24T16:00:00Z", "type": "session_meta",
+             "payload": {"id": "mixed", "cwd": "/work/repo"}},
+            {"timestamp": "2026-02-24T16:00:01Z", "type": "event_msg",
+             "payload": {"type": "user_message", "message": "event user"}},
+            {"timestamp": "2026-02-24T16:00:02Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": "response assistant"}},
+        ]
+        session_file.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+        result = _parse_codex_session_file(
+            session_file, mock_anonymizer, include_thinking=True, target_cwd="/work/repo",
+        )
+
+        assert [(message["role"], message["content"]) for message in result["messages"]] == [
+            ("user", "event user"), ("assistant", "response assistant"),
+        ]
+
+    def test_dual_channel_duplicates_are_removed_by_occurrence_count(
+        self, tmp_path, mock_anonymizer,
+    ):
+        session_file = tmp_path / "dual-channel.jsonl"
+        entries = [
+            {"timestamp": "2026-02-24T16:00:00Z", "type": "session_meta",
+             "payload": {"id": "dual", "cwd": "/work/repo"}},
+            {"timestamp": "2026-02-24T16:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": "same user"}},
+            {"timestamp": "2026-02-24T16:00:01.1Z", "type": "event_msg",
+             "payload": {"type": "user_message", "message": "same user"}},
+            {"timestamp": "2026-02-24T16:00:02Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": "same answer"}},
+            {"timestamp": "2026-02-24T16:00:02.1Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "message": "same answer"}},
+            # A second event-only occurrence with identical text is legitimate.
+            {"timestamp": "2026-02-24T16:00:03Z", "type": "event_msg",
+             "payload": {"type": "user_message", "message": "same user"}},
+        ]
+        session_file.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+        result = _parse_codex_session_file(
+            session_file, mock_anonymizer, include_thinking=True, target_cwd="/work/repo",
+        )
+
+        assert [(message["role"], message["content"]) for message in result["messages"]] == [
+            ("user", "same user"), ("assistant", "same answer"), ("user", "same user"),
         ]
 
 
@@ -1539,6 +1631,30 @@ class TestParseOpenclawSessionFile:
         assert result["stats"]["input_tokens"] == 50
         assert result["stats"]["output_tokens"] == 20
         fpath.unlink()
+
+    def test_archived_files_get_stable_unique_ids(self, tmp_path, mock_anonymizer):
+        entries = [
+            _make_openclaw_session_header(session_id="shared"),
+            _make_openclaw_user_message("Hello"),
+        ]
+        session_dir = tmp_path / "main" / "sessions"
+        session_dir.mkdir(parents=True)
+        paths = [
+            session_dir / "shared.jsonl",
+            session_dir / "shared.jsonl.reset.2026-01-01T00-00-00Z",
+            session_dir / "shared.jsonl.deleted.2026-01-02T00-00-00Z",
+        ]
+        for path in paths:
+            path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+        parsed = [_parse_openclaw_session_file(path, mock_anonymizer) for path in paths]
+        ids = [session["session_id"] for session in parsed]
+
+        assert ids[0] == "shared"
+        assert len(set(ids)) == 3
+        assert parsed[1]["session_status"] == "reset"
+        assert parsed[2]["session_status"] == "deleted"
+        assert _parse_openclaw_session_file(paths[1], mock_anonymizer)["session_id"] == ids[1]
 
     def test_thinking_included(self, mock_anonymizer):
         """Thinking blocks should be included when include_thinking=True."""
@@ -1721,7 +1837,7 @@ class TestDiscoverOpenclawProjects:
                 _make_openclaw_assistant_message(f"Reply {i}"),
             ]
             (sessions_dir / f"{sid}.jsonl").write_text(
-                "\n".join(json.dumps(l) for l in lines) + "\n"
+                "\n".join(json.dumps(line) for line in lines) + "\n"
             )
 
         monkeypatch.setattr("agentstracer.parser.OPENCLAW_AGENTS_DIR", agents_dir)
@@ -1744,7 +1860,7 @@ class TestDiscoverOpenclawProjects:
             _make_openclaw_assistant_message("Hi!", usage={"input": 10, "output": 5}),
         ]
         (sessions_dir / "sess-1.jsonl").write_text(
-            "\n".join(json.dumps(l) for l in lines) + "\n"
+            "\n".join(json.dumps(line) for line in lines) + "\n"
         )
 
         monkeypatch.setattr("agentstracer.parser.OPENCLAW_AGENTS_DIR", agents_dir)
@@ -1770,7 +1886,7 @@ class TestDiscoverOpenclawProjects:
                 _make_openclaw_assistant_message(f"Reply from {agent_name}"),
             ]
             (sessions_dir / f"{sid}.jsonl").write_text(
-                "\n".join(json.dumps(l) for l in lines) + "\n"
+                "\n".join(json.dumps(line) for line in lines) + "\n"
             )
 
         monkeypatch.setattr("agentstracer.parser.OPENCLAW_AGENTS_DIR", agents_dir)
@@ -1863,6 +1979,27 @@ class TestDiscoverCustomProjects:
         sessions = parse_project_sessions("test-proj", mock_anonymizer, source="custom")
         assert len(sessions) == 1
         assert sessions[0]["session_id"] == "s1"
+
+    def test_parse_skips_wrong_field_types_and_continues(
+        self, tmp_path, monkeypatch, mock_anonymizer,
+    ):
+        custom_dir = tmp_path / "custom"
+        proj = custom_dir / "test-proj"
+        proj.mkdir(parents=True)
+        invalid = [
+            {"session_id": "bad-messages", "model": "m", "messages": None},
+            {"session_id": 42, "model": "m", "messages": []},
+            {"session_id": "bad-model", "model": {}, "messages": []},
+            {"session_id": "bad-item", "model": "m", "messages": ["not-an-object"]},
+        ]
+        lines = [json.dumps(item) for item in invalid]
+        lines.append(self._make_valid_session("valid"))
+        (proj / "data.jsonl").write_text("\n".join(lines) + "\n")
+        monkeypatch.setattr("agentstracer.parser.CUSTOM_DIR", custom_dir)
+
+        sessions = parse_project_sessions("test-proj", mock_anonymizer, source="custom")
+
+        assert [session["session_id"] for session in sessions] == ["valid"]
 
     def test_parse_skips_invalid_json(self, tmp_path, monkeypatch, mock_anonymizer):
         custom_dir = tmp_path / "custom"
@@ -1986,6 +2123,7 @@ class TestKimiCodeMigratedSession:
         assert session["messages"][0]["content"] == "Hello"
         assert session["messages"][1]["role"] == "assistant"
         assert session["messages"][1]["content"] == "Hi there!"
+        assert session["messages"][1]["timestamp"] is not None
         assert session["messages"][1]["thinking"] == "I should greet the user."
         assert len(session["messages"][1]["tool_uses"]) == 1
         tool = session["messages"][1]["tool_uses"][0]
@@ -2066,6 +2204,7 @@ class TestKimiCodeNativeSession:
 
         assistant_msg = session["messages"][1]
         assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["timestamp"] is not None
         assert assistant_msg["thinking"] == "I will run ls."
         assert assistant_msg["content"] == "Done."
         assert len(assistant_msg["tool_uses"]) == 1
@@ -2090,3 +2229,36 @@ class TestKimiCodeNativeSession:
         assert len(sessions) == 1
         assistant_msg = sessions[0]["messages"][1]
         assert "thinking" not in assistant_msg
+
+    def test_unclosed_steps_flush_on_next_begin_and_eof(self, tmp_path, mock_anonymizer):
+        session_dir = tmp_path / "project" / "interrupted-session"
+        wire = session_dir / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True)
+        entries = [
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:01Z",
+             "event": {"type": "step.begin"}},
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:02Z",
+             "event": {"type": "content.part", "part": {"type": "text", "text": "first"}}},
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:03Z",
+             "event": {"type": "step.begin"}},
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:04Z",
+             "event": {"type": "tool.call", "toolCallId": "tool-1", "name": "Read",
+                       "args": {"path": "README.md"}}},
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:05Z",
+             "event": {"type": "tool.result", "toolCallId": "tool-1",
+                       "result": {"output": "contents"}}},
+            {"type": "context.append_loop_event", "time": "2026-01-01T00:00:06Z",
+             "event": {"type": "content.part", "part": {"type": "text", "text": "second"}}},
+        ]
+        wire.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+        session = _parse_kimi_session_file(session_dir, mock_anonymizer)
+
+        assert [message["content"] for message in session["messages"]] == ["first", "second"]
+        assert [message["timestamp"] for message in session["messages"]] == [
+            "2026-01-01T00:00:02Z", "2026-01-01T00:00:06Z",
+        ]
+        tool = session["messages"][1]["tool_uses"][0]
+        assert tool["output"] == "contents"
+        assert session["stats"]["assistant_messages"] == 2
+        assert session["stats"]["tool_uses"] == 1

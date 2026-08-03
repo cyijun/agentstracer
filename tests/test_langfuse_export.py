@@ -1,6 +1,7 @@
 """OTLP serialization, transport, verification, and idempotency tests."""
 
 import json
+import stat
 import urllib.error
 from io import BytesIO
 from unittest.mock import patch
@@ -72,6 +73,18 @@ def test_config_normalizes_supported_endpoint_forms(monkeypatch):
         LangfuseConfig.from_env()
 
 
+@pytest.mark.parametrize("base_url", [
+    "ftp://langfuse.example.com",
+    "https://user:password@langfuse.example.com",
+    "https://langfuse.example.com?token=secret",
+    "//langfuse.example.com",
+    "https://langfuse.example.com\\@evil.example",
+])
+def test_config_rejects_unsafe_base_urls(base_url):
+    with pytest.raises(LangfuseExportError):
+        LangfuseConfig(base_url, "public", "secret")
+
+
 def test_otlp_span_contains_langfuse_v4_attributes_and_parent_ids():
     trace = _trace()
     span = observation_to_otlp(trace, trace.observations[1])
@@ -83,10 +96,14 @@ def test_otlp_span_contains_langfuse_v4_attributes_and_parent_ids():
     assert json.loads(attrs["langfuse.observation.usage_details"]) == {
         "input": 3, "output": 2,
     }
-    assert json.loads(attrs["langfuse.trace.input"]) == {"task": "test"}
-    assert json.loads(attrs["langfuse.trace.output"]) == {"ok": True}
+    assert "langfuse.trace.input" not in attrs
+    assert "langfuse.trace.output" not in attrs
     assert attrs["session.id"] == trace.session_id
     assert attrs["langfuse.session.id"] == trace.session_id
+
+    root_attrs = _attributes(observation_to_otlp(trace, trace.root))
+    assert json.loads(root_attrs["langfuse.observation.input"]) == {"task": "test"}
+    assert json.loads(root_attrs["langfuse.observation.output"]) == {"ok": True}
 
 
 def test_otlp_serializes_causal_span_links():
@@ -142,6 +159,81 @@ def test_otlp_http_json_transport_uses_v4_header():
     assert span_count == 3
 
 
+def test_export_batches_are_bounded_by_serialized_bytes():
+    requests = []
+
+    class Response:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self, _size=None):
+            return b"{}"
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return Response()
+
+    config = LangfuseConfig(
+        "http://langfuse.example.com:3000", "public", "secret",
+        ingestion_version="4",
+    )
+    with patch("agentstracer.langfuse_export.urllib.request.urlopen", side_effect=urlopen):
+        LangfuseOTLPClient(config).export_trace(
+            _trace(), batch_spans=3, max_batch_bytes=1,
+        )
+    assert len(requests) == 3
+
+
+def test_transport_rejects_oversized_response():
+    class Response:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self, _size=None):
+            return b"too-large"
+
+    config = LangfuseConfig(
+        "http://langfuse.example.com:3000", "public", "secret",
+        ingestion_version="4",
+    )
+    with patch("agentstracer.langfuse_export.MAX_RESPONSE_BYTES", 2), \
+         patch("agentstracer.langfuse_export.urllib.request.urlopen", return_value=Response()):
+        with pytest.raises(LangfuseExportError, match="safety limit"):
+            LangfuseOTLPClient(config).export_trace(_trace())
+
+
+def test_v4_observation_read_follows_cursor_pages():
+    client = LangfuseOTLPClient(LangfuseConfig(
+        "http://langfuse.example.com:3000", "public", "secret",
+        ingestion_version="4",
+    ))
+    with patch.object(client, "_observation_request", side_effect=[
+        {"data": [{"id": "one"}], "meta": {"cursor": "next-page"}},
+        {"data": [{"id": "two"}], "meta": {"cursor": None}},
+    ]) as request:
+        result = client.get_observations("trace", limit=2)
+    assert [row["id"] for row in result["data"]] == ["one", "two"]
+    assert "cursor=next-page" in request.call_args_list[1].args[0]
+
+
+def test_v3_observation_read_follows_numbered_pages():
+    client = LangfuseOTLPClient(LangfuseConfig(
+        "http://langfuse.example.com:3000", "public", "secret",
+        ingestion_version="3",
+    ))
+    with patch.object(client, "_observation_request", side_effect=[
+        {"data": [{"id": "one"}], "meta": {"totalPages": 2}},
+        {"data": [{"id": "two"}], "meta": {"totalPages": 2}},
+    ]) as request:
+        result = client.get_observations("trace", limit=2)
+    assert [row["id"] for row in result["data"]] == ["one", "two"]
+    assert "page=2" in request.call_args_list[1].args[0]
+
+
 def test_doctor_falls_back_to_langfuse_v3_observations_api():
     class Response:
         status = 200
@@ -180,8 +272,10 @@ def test_doctor_falls_back_to_langfuse_v3_observations_api():
 
 def test_get_observations_caps_limit_for_each_langfuse_version():
     class Client(LangfuseOTLPClient):
+        last_url = ""
         def _observation_request(self, url):
-            return {"url": url, "data": []}
+            self.last_url = url
+            return {"data": []}
 
     v3 = Client(LangfuseConfig(
         base_url="http://langfuse.example.com:3000",
@@ -191,8 +285,10 @@ def test_get_observations_caps_limit_for_each_langfuse_version():
         base_url="http://langfuse.example.com:3000",
         public_key="public", secret_key="secret", ingestion_version="4",
     ))
-    assert "limit=100" in v3.get_observations("trace", limit=900)["url"]
-    assert "limit=900" in v4.get_observations("trace", limit=900)["url"]
+    v3.get_observations("trace", limit=900)
+    v4.get_observations("trace", limit=900)
+    assert "limit=100" in v3.last_url
+    assert "limit=900" in v4.last_url
 
 
 def test_langfuse_v3_export_omits_v4_ingestion_header():
@@ -260,7 +356,11 @@ def test_sync_ledger_skips_successful_snapshot_and_polls_verification(tmp_path):
             self.read_calls += 1
             return {
                 "data": [] if self.read_calls == 1 else [
-                    {"traceId": trace_id, "name": "search"},
+                    {"traceId": trace_id, "name": "run-agent", "type": "SPAN"},
+                    {"traceId": trace_id, "name": "generate", "type": "GENERATION",
+                     "parentObservationId": "root"},
+                    {"traceId": trace_id, "name": "search", "type": "SPAN",
+                     "parentObservationId": "root"},
                 ],
             }
 
@@ -282,6 +382,7 @@ def test_sync_ledger_skips_successful_snapshot_and_polls_verification(tmp_path):
     assert second["verified_tool_names"] == ["search"]
     assert client.export_calls == 1
     assert client.read_calls == 3
+    assert stat.S_IMODE(ledger.stat().st_mode) == 0o600
 
 
 def test_verification_failure_does_not_make_accepted_trace_retryable(tmp_path):
@@ -307,3 +408,44 @@ def test_verification_failure_does_not_make_accepted_trace_retryable(tmp_path):
     assert result["verification_failed"] == 1
     assert retry["traces_skipped"] == 1
     assert client.export_calls == 1
+
+
+def test_partial_batch_progress_resumes_without_resending(tmp_path):
+    class Client(LangfuseOTLPClient):
+        def __init__(self):
+            super().__init__(LangfuseConfig(
+                "https://langfuse.example.com", "public", "secret",
+                ingestion_version="4",
+            ))
+            self.requests = []
+            self.fail_second_request = True
+
+        def export_trace(self, trace, *, start_offset=0, on_progress=None, **kwargs):
+            return super().export_trace(
+                trace,
+                batch_spans=2,
+                start_offset=start_offset,
+                on_progress=on_progress,
+                **kwargs,
+            )
+
+        def _request(self, request, *, retry):
+            body = json.loads(request.data)
+            spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            self.requests.append([span["name"] for span in spans])
+            if self.fail_second_request and len(self.requests) == 2:
+                self.fail_second_request = False
+                raise LangfuseExportError("second batch failed")
+            return 200, b"{}"
+
+    client = Client()
+    ledger = tmp_path / "resume.db"
+    first = sync_traces([_trace()], client=client, ledger_path=ledger)
+    second = sync_traces([_trace()], client=client, ledger_path=ledger)
+    assert first["traces_failed"] == 1
+    assert second["traces_exported"] == 1
+    assert client.requests == [
+        ["run-agent", "generate"],
+        ["search"],
+        ["search"],
+    ]

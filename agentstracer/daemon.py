@@ -1,31 +1,22 @@
 """Local daemon for the scientist workbench — scanner + HTTP API."""
 
-import hashlib
 import io
 import json
 import logging
-import os
-import re
 import sqlite3
 import threading
-import time
-import uuid
 import zipfile
 from datetime import datetime, timezone
-from functools import partial
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__
 from .anonymizer import Anonymizer
-from .badges import compute_all_badges
-from .config import CONFIG_DIR, load_config, save_config
+from .config import CONFIG_DIR, load_config
 from .index import (
-    EXPORT_FIELDS,
     add_policy,
+    build_bundle_export,
     create_bundle,
     export_bundle_to_disk,
     get_bundle,
@@ -54,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
+MAX_REQUEST_BODY_BYTES = 1_048_576
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # NOTE: Network features removed - local-only mode
 _share_rate_lock = threading.Lock()
@@ -72,7 +65,8 @@ class Scanner:
         self.source_filter = source_filter
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_scan_mtimes: dict[str, float] = {}
+        self._last_scan_fingerprints: dict[str, tuple[int, int, int]] = {}
+        self._scan_lock = threading.Lock()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -85,6 +79,10 @@ class Scanner:
 
     def scan_once(self) -> dict[str, int]:
         """Run a single scan pass. Returns {source: new_session_count}."""
+        with self._scan_lock:
+            return self._scan_once()
+
+    def _scan_once(self) -> dict[str, int]:
         conn = open_index()
         try:
             config = load_config()
@@ -101,6 +99,15 @@ class Scanner:
                 if self.source_filter and source != self.source_filter:
                     continue
 
+                cache_key = f"{source}\0{project.get('dir_name', '')}"
+                fingerprint = (
+                    int(project.get("session_count", 0) or 0),
+                    int(project.get("total_size_bytes", 0) or 0),
+                    int(project.get("latest_mtime_ns", 0) or 0),
+                )
+                if self._last_scan_fingerprints.get(cache_key) == fingerprint:
+                    continue
+
                 try:
                     sessions = parse_project_sessions(
                         project["dir_name"],
@@ -111,6 +118,7 @@ class Scanner:
                     if sessions:
                         new_count = upsert_sessions(conn, sessions)
                         results[source] = results.get(source, 0) + new_count
+                    self._last_scan_fingerprints[cache_key] = fingerprint
                 except Exception:
                     logger.exception("Error parsing project %s", project["dir_name"])
 
@@ -119,7 +127,7 @@ class Scanner:
             conn.close()
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        while not self._stop_event.wait(SCAN_INTERVAL):
             try:
                 results = self.scan_once()
                 total_new = sum(results.values())
@@ -127,7 +135,6 @@ class Scanner:
                     logger.info("Indexed %d new sessions: %s", total_new, results)
             except Exception:
                 logger.exception("Scanner error")
-            self._stop_event.wait(SCAN_INTERVAL)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200) -> None:
@@ -136,18 +143,59 @@ def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def _read_body(handler: BaseHTTPRequestHandler) -> dict:
+class RequestError(ValueError):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def _read_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     """Read and parse JSON body from request."""
-    length = int(handler.headers.get("Content-Length", 0))
+    cached = getattr(handler, "_json_body", None)
+    if cached is not None:
+        return cached
+    content_type = handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise RequestError("Content-Type must be application/json", 415)
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+    except (TypeError, ValueError) as exc:
+        raise RequestError("Invalid Content-Length") from exc
+    if length < 0:
+        raise RequestError("Invalid Content-Length")
+    if length > MAX_REQUEST_BODY_BYTES:
+        raise RequestError("Request body too large", 413)
     if length == 0:
-        return {}
+        data: dict[str, Any] = {}
+        setattr(handler, "_json_body", data)
+        return data
     raw = handler.rfile.read(length)
-    return json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestError("Invalid JSON body") from exc
+    if not isinstance(data, dict):
+        raise RequestError("JSON body must be an object")
+    setattr(handler, "_json_body", data)
+    return data
+
+
+def _parse_int_param(
+    params: dict[str, list[str]], name: str, default: int, minimum: int, maximum: int,
+) -> int:
+    try:
+        value = int(params.get(name, [str(default)])[0])
+    except (TypeError, ValueError) as exc:
+        raise RequestError(f"Invalid {name}") from exc
+    if not minimum <= value <= maximum:
+        raise RequestError(f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
 def _parse_json_fields(rows: list[dict]) -> None:
@@ -188,6 +236,22 @@ def _parse_json_fields(rows: list[dict]) -> None:
             row["risk_level"] = row.pop("risk_badges")
 
 
+def _anonymize_data(value: Any, anonymizer: Anonymizer) -> Any:
+    if isinstance(value, str):
+        return anonymizer.text(value)
+    if isinstance(value, list):
+        return [_anonymize_data(item, anonymizer) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            safe_key = anonymizer.text(str(key))
+            while safe_key in result:
+                safe_key += "_"
+            result[safe_key] = _anonymize_data(item, anonymizer)
+        return result
+    return value
+
+
 
 def share_bundle(
     conn: sqlite3.Connection,
@@ -214,14 +278,63 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(format, *args)
 
+    def _request_is_local(self) -> bool:
+        """Reject cross-origin browser access and DNS-rebinding Host headers."""
+        host_header = self.headers.get("Host", "")
+        try:
+            host = urlparse(f"//{host_header}").hostname
+        except ValueError:
+            host = None
+        if not host or host.lower() not in _LOOPBACK_HOSTS:
+            _json_response(self, {"error": "Loopback Host header required"}, 403)
+            return False
+
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            _json_response(self, {"error": "Cross-origin requests are not allowed"}, 403)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            try:
+                parsed_origin = urlparse(origin)
+                origin_host = parsed_origin.hostname
+            except ValueError:
+                origin_host = None
+                parsed_origin = None
+            if (
+                origin == "null"
+                or parsed_origin is None
+                or parsed_origin.scheme not in ("http", "https")
+                or not origin_host
+                or origin_host.lower() not in _LOOPBACK_HOSTS
+                or parsed_origin.netloc.lower() != host_header.lower()
+            ):
+                _json_response(self, {"error": "Cross-origin requests are not allowed"}, 403)
+                return False
+        return True
+
+    def _handle_request_error(self, exc: RequestError) -> None:
+        _json_response(self, {"error": str(exc)}, exc.status)
+
     def do_OPTIONS(self) -> None:
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if not self._request_is_local():
+            return
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._request_is_local():
+            return
+        try:
+            self._dispatch_get()
+        except RequestError as exc:
+            self._handle_request_error(exc)
+        except Exception:
+            logger.exception("Unhandled GET request error")
+            _json_response(self, {"error": "Internal server error"}, 500)
+
+    def _dispatch_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
@@ -267,6 +380,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._serve_static(parsed.path)
 
     def do_POST(self) -> None:
+        if not self._request_is_local():
+            return
+        if hasattr(self, "_json_body"):
+            delattr(self, "_json_body")
+        try:
+            self._dispatch_post()
+        except RequestError as exc:
+            self._handle_request_error(exc)
+        except (TypeError, ValueError) as exc:
+            _json_response(self, {"error": f"Invalid request: {exc}"}, 400)
+        except Exception:
+            logger.exception("Unhandled POST request error")
+            _json_response(self, {"error": "Internal server error"}, 500)
+
+    def _dispatch_post(self) -> None:
+        _read_body(self)
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -293,6 +422,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _json_response(self, {"error": "Not found"}, 404)
 
     def do_DELETE(self) -> None:
+        if not self._request_is_local():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
@@ -319,8 +450,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 search_text=params.get("q", [None])[0],
                 sort=params.get("sort", ["start_time"])[0],
                 order=params.get("order", ["desc"])[0],
-                limit=int(params.get("limit", ["50"])[0]),
-                offset=int(params.get("offset", ["0"])[0]),
+                limit=_parse_int_param(params, "limit", 50, 1, 1000),
+                offset=_parse_int_param(params, "offset", 0, 0, 1_000_000),
             )
             _parse_json_fields(result)
             _json_response(self, result)
@@ -374,8 +505,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         try:
             results = search_fts(
                 conn, q,
-                limit=int(params.get("limit", ["50"])[0]),
-                offset=int(params.get("offset", ["0"])[0]),
+                limit=_parse_int_param(params, "limit", 50, 1, 1000),
+                offset=_parse_int_param(params, "offset", 0, 0, 1_000_000),
             )
             _parse_json_fields(results)
             _json_response(self, results)
@@ -428,18 +559,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             # Anonymize paths and usernames
             extra = config.get("redact_usernames", [])
             anon = Anonymizer(extra_usernames=extra)
-            for field in ("display_title", "project", "git_branch"):
-                if detail.get(field) and isinstance(detail[field], str):
-                    detail[field] = anon.text(detail[field])
-            for msg in detail.get("messages", []):
-                for field in ("content", "thinking"):
-                    if msg.get(field) and isinstance(msg[field], str):
-                        msg[field] = anon.text(msg[field])
-                for tool_use in msg.get("tool_uses", []):
-                    for field in ("input", "output"):
-                        val = tool_use.get(field)
-                        if val and isinstance(val, str):
-                            tool_use[field] = anon.text(val)
+            detail = _anonymize_data(detail, anon)
             _json_response(self, detail)
         finally:
             conn.close()
@@ -464,18 +584,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             # Anonymize paths and usernames
             extra = config.get("redact_usernames", [])
             anon = Anonymizer(extra_usernames=extra)
-            for field in ("display_title", "project", "git_branch"):
-                if detail.get(field) and isinstance(detail[field], str):
-                    detail[field] = anon.text(detail[field])
-            for msg in detail.get("messages", []):
-                for field in ("content", "thinking"):
-                    if msg.get(field) and isinstance(msg[field], str):
-                        msg[field] = anon.text(msg[field])
-                for tool_use in msg.get("tool_uses", []):
-                    for field in ("input", "output"):
-                        val = tool_use.get(field)
-                        if val and isinstance(val, str):
-                            tool_use[field] = anon.text(val)
+            detail = _anonymize_data(detail, anon)
             _json_response(self, {
                 "session_id": session_id,
                 "redaction_count": redaction_count,
@@ -531,7 +640,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         entries = config.get("allowlist_entries", [])
         entries.append(entry)
         config["allowlist_entries"] = entries
-        save_config(config)
+        if save_config(config) is False:
+            _json_response(self, {"error": "Could not persist allowlist configuration"}, 500)
+            return
         _json_response(self, {"ok": True, "entry": entry})
 
     def _handle_remove_allowlist(self, entry_id: str) -> None:
@@ -544,7 +655,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _json_response(self, {"error": "Entry not found"}, 404)
             return
         config["allowlist_entries"] = new_entries
-        save_config(config)
+        if save_config(config) is False:
+            _json_response(self, {"error": "Could not persist allowlist configuration"}, 500)
+            return
         _json_response(self, {"ok": True})
 
     def _handle_share_ready(self) -> None:
@@ -587,8 +700,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_create_bundle(self) -> None:
         body = _read_body(self)
         session_ids = body.get("session_ids", [])
-        if not session_ids:
-            _json_response(self, {"error": "session_ids required"}, 400)
+        if (
+            not isinstance(session_ids, list)
+            or not session_ids
+            or len(session_ids) > 1000
+            or any(not isinstance(item, str) or not item for item in session_ids)
+        ):
+            _json_response(self, {"error": "session_ids must be a non-empty list of strings (max 1000)"}, 400)
             return
         conn = open_index()
         try:
@@ -698,6 +816,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_export_bundle(self, bundle_id: str) -> None:
         body = _read_body(self)
         output_path = body.get("output_path")
+        config = load_config()
 
         conn = open_index()
         try:
@@ -706,7 +825,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Bundle not found"}, 404)
                 return
 
-            export_dir, manifest = export_bundle_to_disk(conn, bundle_id, bundle, output_path=output_path)
+            export_dir, manifest = export_bundle_to_disk(
+                conn, bundle_id, bundle, output_path=output_path,
+                custom_strings=config.get("redact_strings", []),
+                user_allowlist=config.get("allowlist_entries", []),
+                extra_usernames=config.get("redact_usernames", []),
+            )
             if export_dir is None:
                 _json_response(self, {"error": "output_path must be under home directory or /tmp"}, 400)
                 return
@@ -728,30 +852,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Bundle not found"}, 404)
                 return
 
-            # Build sessions JSONL content
-            lines = []
-            manifest_sessions = []
-            for s in bundle.get("sessions", []):
-                detail = get_session_detail(conn, s["session_id"])
-                if detail:
-                    clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
-                    lines.append(json.dumps(clean, default=str))
-                    manifest_sessions.append({
-                        "session_id": s["session_id"],
-                        "project": s.get("project"),
-                        "source": s.get("source"),
-                        "model": s.get("model"),
-                    })
-
+            config = load_config()
+            lines, manifest = build_bundle_export(
+                conn, bundle_id, bundle,
+                custom_strings=config.get("redact_strings", []),
+                user_allowlist=config.get("allowlist_entries", []),
+                extra_usernames=config.get("redact_usernames", []),
+            )
             sessions_content = "\n".join(lines) + ("\n" if lines else "")
-
-            manifest = {
-                "bundle_id": bundle_id,
-                "session_count": len(manifest_sessions),
-                "attestation": bundle.get("attestation"),
-                "submission_note": bundle.get("submission_note"),
-                "sessions": manifest_sessions,
-            }
             manifest_content = json.dumps(manifest, indent=2, default=str)
 
             # Create in-memory zip
@@ -770,14 +878,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
             # Serve the zip
             date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-            import socket
-            hostname = socket.gethostname()
-            filename = f"agentstracer-bundle-{hostname}-{bundle_id[:8]}-{date_str}.zip"
+            filename = f"agentstracer-bundle-{bundle_id[:8]}-{date_str}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(zip_bytes)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(zip_bytes)
         finally:
@@ -892,11 +999,7 @@ pre { background: #f0f0f0; padding: 12px; border-radius: 6px; overflow-x: auto; 
 </head>
 <body>
 <h1>AgentsTrace Workbench</h1>
-<p>The API is running. The frontend hasn't been built yet.</p>
-<p>To build the frontend:</p>
-<pre>cd agentstracer/web/frontend
-npm install
-npm run build</pre>
+<p>The local workbench API is running. This distribution does not bundle a browser UI.</p>
 <p>API endpoints available:</p>
 <ul>
 <li><a class="api-link" href="/api/stats">/api/stats</a> — Index statistics</li>
@@ -943,7 +1046,7 @@ def run_server(
     if remote:
         import socket
         hostname = socket.gethostname()
-        print(f"\nRemote access — run this on your local machine:")
+        print("\nRemote access — run this on your local machine:")
         print(f"  ssh -L {port}:localhost:{port} <user>@{hostname}")
         print(f"Then open {url}\n")
 
@@ -969,3 +1072,4 @@ def run_server(
     finally:
         scanner.stop()
         server.shutdown()
+        server.server_close()

@@ -1,4 +1,5 @@
 import json
+import stat
 import subprocess
 
 import pytest
@@ -9,12 +10,14 @@ from agentstracer.pii import (
     _extract_json_array,
     _normalize_llm_findings,
     _read_batch_findings,
+    _review_batch_with_claude,
     _review_text_with_agent,
     _split_into_batches,
     _truncate_for_llm,
     apply_findings_to_session,
     apply_findings_to_text,
     load_findings,
+    load_jsonl_sessions,
     merge_findings,
     replacement_for_type,
     review_session_pii,
@@ -22,6 +25,7 @@ from agentstracer.pii import (
     review_session_pii_with_agent,
     review_session_pii_with_claude,
     write_findings,
+    write_jsonl_sessions,
 )
 
 
@@ -69,6 +73,18 @@ def test_apply_findings_to_text_replaces_all_occurrences():
     assert redacted.count("[REDACTED_PERSON]") == 2
 
 
+def test_apply_findings_to_text_redacts_two_character_cjk_name():
+    findings = [{
+        "entity_text": "李雷",
+        "entity_type": "person_name",
+        "replacement": "[REDACTED_PERSON]",
+        "confidence": 0.99,
+    }]
+    redacted, count = apply_findings_to_text("联系人李雷已确认", findings)
+    assert redacted == "联系人[REDACTED_PERSON]已确认"
+    assert count == 1
+
+
 def test_apply_findings_to_session_nested_tool_field():
     session = {
         "session_id": "s1",
@@ -98,6 +114,29 @@ def test_apply_findings_to_session_nested_tool_field():
     redacted, count = apply_findings_to_session(session, findings)
     assert count == 1
     assert redacted["messages"][0]["tool_uses"][0]["input"]["command"] == "echo [REDACTED_PERSON]"
+
+
+def test_apply_findings_to_session_recurses_through_lists_dicts_and_keys():
+    session = {
+        "session_id": "s1",
+        "messages": [{
+            "tool_uses": [{"input": {"payload": [{"Alice": "contact Alice"}]}}],
+        }],
+        "commands_run": ["notify Alice"],
+    }
+    findings = [{
+        "session_id": "s1",
+        "message_index": 0,
+        "field": "content",
+        "entity_text": "Alice",
+        "entity_type": "person_name",
+        "replacement": "[REDACTED_PERSON]",
+        "confidence": 0.99,
+    }]
+    redacted, count = apply_findings_to_session(session, findings)
+    assert "Alice" not in str(redacted)
+    assert redacted["session_id"] == "s1"
+    assert count == 3
 
 
 def test_review_session_pii_detects_metadata_entities():
@@ -150,6 +189,15 @@ def test_metadata_id_pattern_only_matches_numeric_ids():
     assert "9876543210" in entity_texts
 
 
+def test_metadata_id_pattern_matches_unquoted_numeric_ids():
+    session = {
+        "session_id": "s1",
+        "messages": [{"content": '{"user_id":9876543210,"name":"Bot"}'}],
+    }
+    findings = review_session_pii(session)
+    assert any(f["entity_text"] == "9876543210" for f in findings)
+
+
 def test_write_and_load_findings_roundtrip(tmp_path):
     path = tmp_path / "findings.json"
     findings = [
@@ -167,6 +215,31 @@ def test_write_and_load_findings_roundtrip(tmp_path):
     assert len(loaded) == 1
     assert loaded[0]["entity_text"] == "Kai D"
     assert json.loads(path.read_text())["provider"] == "rules"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_jsonl_sessions_is_private_and_roundtrips(tmp_path):
+    path = tmp_path / "sessions.jsonl"
+    sessions = [{"session_id": "s1", "messages": [{"content": "private"}]}]
+
+    write_jsonl_sessions(path, sessions)
+
+    assert load_jsonl_sessions(path) == sessions
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_atomic_sensitive_write_preserves_existing_file_on_serialization_error(tmp_path):
+    path = tmp_path / "sessions.jsonl"
+    path.write_text("original\n", encoding="utf-8")
+
+    with pytest.raises(TypeError):
+        write_jsonl_sessions(path, [
+            {"session_id": "valid"},
+            {"session_id": {"not", "json"}},
+        ])
+
+    assert path.read_text(encoding="utf-8") == "original\n"
+    assert list(tmp_path.glob(".sessions.jsonl.*.tmp")) == []
 
 
 def test_extract_json_array_from_wrapped_text():
@@ -367,6 +440,46 @@ def test_collect_text_work_items_tool_uses():
     assert "tool_uses[0].output" in fields
 
 
+def test_collect_text_work_items_recurses_and_includes_top_level_metadata():
+    session = {
+        "session_id": "s1",
+        "project": "Acme Private",
+        "messages": [{
+            "tool_uses": [{
+                "input": {"payload": [{"owner": "Alice Example"}]},
+            }],
+        }],
+    }
+    items = _collect_text_work_items(session)
+    by_field = {field: text for _, _, field, text in items}
+    assert by_field["project"] == "Acme Private"
+    assert by_field["tool_uses[0].input.payload[0].owner"] == "Alice Example"
+
+
+def test_collect_text_work_items_chunks_long_fields_without_losing_middle():
+    marker = "Alice Example"
+    text = "a" * 13_000 + marker + "b" * 13_000
+    items = _collect_text_work_items({
+        "session_id": "s1",
+        "messages": [{"content": text}],
+    })
+    chunks = [item[3] for item in items]
+    assert len(chunks) >= 3
+    assert all(len(chunk) <= 12_000 for chunk in chunks)
+    assert any(marker in chunk for chunk in chunks)
+
+
+def test_review_session_pii_recurses_nested_tool_values():
+    session = {
+        "session_id": "s1",
+        "messages": [{
+            "tool_uses": [{"input": {"payload": [{"email": "alice@corp.com"}]}}],
+        }],
+    }
+    findings = review_session_pii(session)
+    assert any(f["entity_text"] == "alice@corp.com" for f in findings)
+
+
 def test_collect_text_work_items_skips_empty():
     session = {"session_id": "s1", "messages": [{"content": "   "}]}
     assert _collect_text_work_items(session) == []
@@ -428,6 +541,21 @@ def test_review_text_with_agent_unsupported_backend(monkeypatch):
     monkeypatch.setattr("agentstracer.pii.check_backend_runtime", lambda b: None)
     with pytest.raises(RuntimeError, match="Unsupported PII backend"):
         _review_text_with_agent("s1", 0, "content", "test", backend="gemini")
+
+
+def test_claude_review_never_bypasses_permissions(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr("agentstracer.pii.require_backend_command", lambda _backend: "/bin/claude")
+    monkeypatch.setattr("agentstracer.pii.subprocess.run", fake_run)
+    assert _review_batch_with_claude(
+        "s1", [("s1", 0, "content", "hello")], rubric=None,
+    ) == []
+    assert "bypassPermissions" not in captured["cmd"]
 
 
 # ---------------------------------------------------------------------------

@@ -111,6 +111,12 @@ class TestScanText:
         findings = scan_text(key)
         assert any(f["type"] == "openai_key" for f in findings)
 
+    @pytest.mark.parametrize("prefix", ["sk-proj-", "sk-svcacct-"])
+    def test_openai_project_and_service_account_keys(self, prefix):
+        key = prefix + "aB3xZ9qR2mK7pL4wN8yJ5tF1hG6"
+        findings = scan_text(key)
+        assert any(f["type"] == "openai_project_key" for f in findings)
+
     def test_langfuse_secret_key(self):
         key = "sk-lf-12345678-1234-1234-1234-123456789abc"
         findings = scan_text(key)
@@ -125,6 +131,16 @@ class TestScanText:
         token = "ghp_" + "a" * 36
         findings = scan_text(token)
         assert any(f["type"] == "github_token" for f in findings)
+
+    def test_github_fine_grained_token(self):
+        token = "github_pat_" + "aB3xZ9qR2mK7pL4wN8yJ5tF1hG6cD0eW2vU"
+        findings = scan_text(token)
+        assert any(f["type"] == "github_fine_grained_token" for f in findings)
+
+    def test_telegram_bot_token(self):
+        token = "123456789:" + "aB3xZ9qR2mK7pL4wN8yJ5tF1hG6cD0"
+        findings = scan_text(token)
+        assert any(f["type"] == "telegram_bot_token" for f in findings)
 
     def test_pypi_token(self):
         token = "pypi-" + "a" * 60
@@ -312,6 +328,13 @@ class TestRedactText:
         assert jwt not in result
         assert count >= 1
 
+    def test_overlapping_url_token_does_not_expose_database_credentials(self):
+        text = "postgres://user:p$@db.internal/x?token=abcdefghijk"
+        result, count, _log = redact_text(text)
+        assert result == REDACTED
+        assert "user:p$" not in result
+        assert count == 1
+
     def test_none_text(self):
         result, count, log = redact_text(None)
         assert result is None
@@ -443,6 +466,45 @@ class TestRedactSession:
         assert "Acme Corp" not in result["messages"][0]["content"]
         assert count >= 1
 
+    def test_redacts_complete_export_shape_recursively(self):
+        token = "abcDEFGH12345678"
+        session = {
+            "commands_run": [f"deploy --token {token}"],
+            "files_touched": [{"nested": [f"backup --token {token}"]}],
+            "messages": [{
+                "tool_uses": [{
+                    "input": {
+                        "payload": {f"token={token}": [f"deploy --token {token}"]},
+                    },
+                }],
+            }],
+        }
+        result, count, _log = redact_session(session)
+        serialized = str(result)
+        assert token not in serialized
+        assert count >= 4
+        assert REDACTED in result["commands_run"][0]
+
+    def test_custom_strings_apply_to_derived_export_fields(self):
+        session = {
+            "commands_run": ["ship AcmeSecret"],
+            "files_touched": ["AcmeSecret/private.txt"],
+            "messages": [{"content": "AcmeSecret"}],
+        }
+        result, count, _log = redact_session(session, custom_strings=["AcmeSecret"])
+        assert "AcmeSecret" not in str(result)
+        assert count == 3
+
+    def test_structured_secret_key_marks_opaque_value(self):
+        opaque = "opaqueValue12345"
+        session = {
+            "messages": [{"tool_uses": [{"input": {"api_key": opaque}}]}],
+            "commands_run": [f"client --credential {opaque}"],
+        }
+        result, count, _log = redact_session(session)
+        assert opaque not in str(result)
+        assert count == 2
+
     def test_no_content_fields_skipped(self):
         session = {
             "messages": [
@@ -539,6 +601,14 @@ class TestConfidence:
         ip_entry = next(e for e in log if e["type"] == "ip_address")
         assert "context_before" in ip_entry
         assert "context_after" in ip_entry
+
+    def test_log_context_never_reexposes_neighbouring_low_confidence_pii(self):
+        first = "alice@corp.com"
+        second = "bob@corp.com"
+        _result, _count, log = redact_text(f"first {first} then {second} end")
+        serialized = str(log)
+        assert first not in serialized
+        assert second not in serialized
 
     def test_no_context_for_high_confidence(self):
         """High-confidence findings should NOT include context."""

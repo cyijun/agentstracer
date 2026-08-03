@@ -42,3 +42,4 @@ Thumbs.db
 *.db
 *.log
 .clawtrace/
+node_modules/

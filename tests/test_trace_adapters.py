@@ -950,6 +950,70 @@ def test_openclaw_trajectory_enriches_raw_session_without_duplicate(tmp_path, mo
     assert generation.output["tool_calls"][0]["arguments"] == {"cmd": "pwd"}
 
 
+def test_openclaw_active_and_deleted_copies_keep_unique_ids_and_active_events(
+    tmp_path, monkeypatch,
+):
+    agents = tmp_path / "agents"
+    session_dir = agents / "main" / "sessions"
+    active = session_dir / "sess.jsonl"
+    deleted = session_dir / "sess.jsonl.deleted.2026-01-02T00-00-00Z"
+    header = {"type": "session", "id": "sess", "cwd": "/work/project"}
+    _jsonl(active, [
+        header,
+        {"type": "message", "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "role": "user", "content": "run active",
+        }},
+        {"type": "message", "timestamp": "2026-01-01T00:00:01Z", "message": {
+            "role": "assistant", "content": "active answer",
+        }},
+    ])
+    _jsonl(deleted, [
+        header,
+        {"type": "message", "timestamp": "2025-12-31T00:00:00Z", "message": {
+            "role": "user", "content": "run deleted",
+        }},
+        {"type": "message", "timestamp": "2025-12-31T00:00:01Z", "message": {
+            "role": "assistant", "content": "deleted answer",
+        }},
+    ])
+    active_trajectory = session_dir / "sess.trajectory.jsonl"
+    _jsonl(active_trajectory, [
+        {"traceId": "native-trace", "seq": 1, "type": "session.started",
+         "ts": "2026-01-01T00:00:00Z", "data": {"sessionFile": str(active)}},
+        {"traceId": "native-trace", "seq": 2, "type": "session.ended",
+         "ts": "2026-01-01T00:00:02Z", "data": {"status": "completed"}},
+    ])
+    _jsonl(session_dir / "sess.trajectory.jsonl.deleted.2026-01-02T00-00-00Z", [
+        {"traceId": "native-trace", "seq": 1, "type": "session.started",
+         "ts": "2025-12-31T00:00:00Z", "data": {"sessionFile": str(deleted)}},
+        {"traceId": "native-trace", "seq": 2, "type": "session.ended",
+         "ts": "2025-12-31T00:00:02Z", "data": {"status": "failed", "terminalError": "stale"}},
+    ])
+    monkeypatch.setattr(adapters, "OPENCLAW_AGENTS_DIR", agents)
+
+    traces = [trace.finalize() for trace in adapters.iter_openclaw_traces()]
+
+    assert len(traces) == 2
+    assert len({trace.source_session_id for trace in traces}) == 2
+    trajectory = next(trace for trace in traces if trace.metadata["adapter"] == "openclaw-trajectory-v2")
+    archived = next(trace for trace in traces if trace.metadata["adapter"] == "openclaw-raw-v2")
+    assert trajectory.source_session_id == "sess"
+    assert trajectory.root.level == "DEFAULT"
+    assert trajectory.root.output == "active answer"
+    assert archived.source_session_id.startswith("sess::deleted::")
+    assert archived.root.metadata["session_status"] == "deleted"
+    assert archived.root.output == "deleted answer"
+
+
+def test_usage_ignores_malformed_numeric_values():
+    assert adapters._usage({
+        "input": "12",
+        "output": "not-a-number",
+        "cacheRead": float("inf"),
+        "reasoning_output_tokens": True,
+    }) == {"input": 12}
+
+
 def test_opencode_parent_sessions_and_exact_tool_times(tmp_path, monkeypatch):
     db = tmp_path / "opencode.db"
     conn = sqlite3.connect(db)

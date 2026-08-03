@@ -24,13 +24,18 @@ SECRET_PATTERNS = [
     ("langfuse_secret", re.compile(r"sk-lf-[A-Za-z0-9-]{30,}")),
 
     # OpenAI API keys
+    ("openai_project_key", re.compile(r"sk-(?:proj|svcacct)-[A-Za-z0-9_-]{20,}")),
     ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
 
     # Hugging Face tokens
     ("hf_token", re.compile(r"hf_[A-Za-z0-9]{20,}")),
 
     # GitHub tokens
+    ("github_fine_grained_token", re.compile(r"github_pat_[A-Za-z0-9_]{30,}")),
     ("github_token", re.compile(r"(?:ghp|gho|ghs|ghr)_[A-Za-z0-9]{30,}")),
+
+    # Telegram bot tokens
+    ("telegram_bot_token", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")),
 
     # PyPI tokens
     ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_-]{50,}")),
@@ -117,8 +122,10 @@ SECRET_PATTERNS = [
 # Low (<0.70): heuristic/PII, may be false positives.
 CONFIDENCE: dict[str, float] = {
     "jwt": 0.98, "private_key": 0.98,
-    "anthropic_key": 0.98, "openai_key": 0.98, "langfuse_secret": 0.98,
-    "github_token": 0.98, "hf_token": 0.98,
+    "anthropic_key": 0.98, "openai_key": 0.98, "openai_project_key": 0.98,
+    "langfuse_secret": 0.98,
+    "github_token": 0.98, "github_fine_grained_token": 0.98,
+    "telegram_bot_token": 0.98, "hf_token": 0.98,
     "pypi_token": 0.98, "npm_token": 0.98,
     "aws_key": 0.98, "aws_secret": 0.95,
     "slack_token": 0.98, "discord_webhook": 0.95,
@@ -206,6 +213,9 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
         for match in pattern.finditer(text):
             matched_text = match.group(0)
 
+            if REDACTED in matched_text or "[REDACTED_" in matched_text:
+                continue
+
             if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
                 continue
 
@@ -233,6 +243,69 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     return findings
 
 
+def _coalesce_findings(text: str, findings: list[dict]) -> list[dict]:
+    """Merge overlapping findings into safe, non-overlapping redaction spans.
+
+    Keeping the later-starting match can expose the prefix of a larger secret
+    (for example, a database URL containing a ``?token=`` parameter).  Redaction
+    must cover the union of every overlapping match.  Metadata is taken from
+    the highest-confidence finding in each union, with the longer match as a
+    deterministic tie-breaker.
+    """
+    if not findings:
+        return []
+
+    ordered = sorted(findings, key=lambda f: (f["start"], f["end"]))
+    groups: list[list[dict]] = []
+    current: list[dict] = [ordered[0]]
+    current_end = ordered[0]["end"]
+
+    for finding in ordered[1:]:
+        if finding["start"] < current_end:
+            current.append(finding)
+            current_end = max(current_end, finding["end"])
+        else:
+            groups.append(current)
+            current = [finding]
+            current_end = finding["end"]
+    groups.append(current)
+
+    merged: list[dict] = []
+    for group in groups:
+        start = min(f["start"] for f in group)
+        end = max(f["end"] for f in group)
+        representative = max(
+            group,
+            key=lambda f: (f.get("confidence", 0.0), f["end"] - f["start"]),
+        )
+        merged.append({
+            **representative,
+            "start": start,
+            "end": end,
+            "match": text[start:end],
+        })
+    return merged
+
+
+def _redact_detected_without_log(
+    text: str,
+    *,
+    user_allowlist: list[dict] | None = None,
+    custom_strings: list[str] | None = None,
+) -> str:
+    """Redact a snippet without producing another potentially sensitive log."""
+    if not text:
+        return text
+    spans = _coalesce_findings(text, scan_text(text, user_allowlist=user_allowlist))
+    result = text
+    for finding in reversed(spans):
+        result = result[:finding["start"]] + REDACTED + result[finding["end"]:]
+    for target in custom_strings or []:
+        if target and len(target) >= 3:
+            result = re.sub(re.escape(target), REDACTED, result, flags=re.IGNORECASE)
+    return result
+
+
 def redact_text(
     text: str, user_allowlist: list[dict] | None = None,
 ) -> tuple[str, int, list[dict]]:
@@ -244,18 +317,11 @@ def redact_text(
     if not findings:
         return text, 0, []
 
-    # Sort by position (descending start) to replace without shifting indices
-    findings.sort(key=lambda f: f["start"], reverse=True)
-
-    # Deduplicate overlapping findings (keep the later-starting match on overlap)
-    deduped = []
-    for f in findings:
-        if not deduped or f["end"] <= deduped[-1]["start"]:
-            deduped.append(f)
+    spans = _coalesce_findings(text, findings)
 
     # Build redaction log (no secret text — only metadata)
     log: list[dict] = []
-    for f in deduped:
+    for f in spans:
         entry: dict = {
             "type": f["type"],
             "confidence": f["confidence"],
@@ -266,20 +332,24 @@ def redact_text(
             start, end = f["start"], f["end"]
             ctx_before = text[max(0, start - 40):start]
             ctx_after = text[end:end + 40]
-            # Redact high-confidence secrets in context (recursive, but only
-            # captures high-conf patterns so no infinite recursion risk)
-            safe_before = _redact_high_confidence_only(ctx_before)
-            safe_after = _redact_high_confidence_only(ctx_after)
+            # Context is part of the report and therefore must not re-expose a
+            # neighbouring low-confidence finding such as another email/IP.
+            safe_before = _redact_detected_without_log(
+                ctx_before, user_allowlist=user_allowlist,
+            )
+            safe_after = _redact_detected_without_log(
+                ctx_after, user_allowlist=user_allowlist,
+            )
             entry["context_before"] = safe_before
             entry["context_after"] = safe_after
         log.append(entry)
 
-    # Replace from end-to-start (deduped is already in descending start order)
+    # Replace from end-to-start so original offsets remain valid.
     result = text
-    for f in deduped:
+    for f in reversed(spans):
         result = result[:f["start"]] + REDACTED + result[f["end"]:]
 
-    return result, len(deduped), log
+    return result, len(spans), log
 
 
 def _redact_high_confidence_only(text: str) -> str:
@@ -290,14 +360,9 @@ def _redact_high_confidence_only(text: str) -> str:
     high_conf = [f for f in findings if f["confidence"] >= 0.90]
     if not high_conf:
         return text
-    high_conf.sort(key=lambda f: f["start"], reverse=True)
-    # Deduplicate overlapping matches (same logic as redact_text)
-    deduped = []
-    for f in high_conf:
-        if not deduped or f["end"] <= deduped[-1]["start"]:
-            deduped.append(f)
+    spans = _coalesce_findings(text, high_conf)
     result = text
-    for f in deduped:
+    for f in reversed(spans):
         result = result[:f["start"]] + REDACTED + result[f["end"]:]
     return result
 
@@ -334,7 +399,10 @@ def _redact_value(
         all_log: list[dict] = []
         out = {}
         for k, v in value.items():
-            out[k], n, log = _redact_value(v, custom_strings, user_allowlist)
+            new_key, key_count, key_log = _redact_value(k, custom_strings, user_allowlist)
+            out[new_key], n, log = _redact_value(v, custom_strings, user_allowlist)
+            total += key_count
+            all_log.extend(key_log)
             total += n
             all_log.extend(log)
         return out, total, all_log
@@ -358,27 +426,47 @@ def _collect_all_text(session: dict) -> list[tuple[str, str, int | None, str | N
     """
     texts: list[tuple[str, str, int | None, str | None]] = []
 
-    for field in ("display_title", "project", "git_branch"):
-        val = session.get(field)
-        if val and isinstance(val, str):
-            texts.append((val, field, None, None))
+    def walk(
+        value: Any,
+        path: str,
+        message_index: int | None = None,
+        tool_field: str | None = None,
+    ) -> None:
+        if isinstance(value, str):
+            if value:
+                field = path or "value"
+                if tool_field:
+                    field = f"tool_{tool_field}"
+                elif message_index is not None and path.rsplit(".", 1)[-1] in ("content", "thinking"):
+                    field = path.rsplit(".", 1)[-1]
+                texts.append((value, field, message_index, tool_field))
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_path = f"{path}.{key}" if path else str(key)
+                if isinstance(key, str) and key:
+                    texts.append((key, f"{key_path}.__key__", message_index, tool_field))
+                    # Preserve key/value association for structured credentials
+                    # such as {"api_key": "opaque-value"}; scanning the value
+                    # alone cannot infer that an otherwise generic string is a
+                    # secret.  Capture-group handling adds just the value to the
+                    # global replacement set.
+                    if isinstance(nested, str) and nested and not scan_text(nested):
+                        texts.append((
+                            f"{key}={nested}", key_path, message_index, tool_field,
+                        ))
+                nested_tool_field = tool_field
+                if key in ("input", "output") and ".tool_uses" in f".{path}":
+                    nested_tool_field = key
+                walk(nested, key_path, message_index, nested_tool_field)
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                item_path = f"{path}[{index}]"
+                item_message_index = index if path == "messages" else message_index
+                walk(item, item_path, item_message_index, tool_field)
 
-    for msg_idx, msg in enumerate(session.get("messages", [])):
-        for field in ("content", "thinking"):
-            val = msg.get(field)
-            if val and isinstance(val, str):
-                texts.append((val, field, msg_idx, None))
-        for tool_use in msg.get("tool_uses", []):
-            for tf in ("input", "output"):
-                val = tool_use.get(tf)
-                if val and isinstance(val, str):
-                    texts.append((val, f"tool_{tf}", msg_idx, tf))
-                elif val and isinstance(val, (dict, list)):
-                    # Flatten structured tool data to scan
-                    flat = _flatten_to_strings(val)
-                    for s in flat:
-                        texts.append((s, f"tool_{tf}", msg_idx, tf))
-
+    walk(session, "")
     return texts
 
 
@@ -423,7 +511,9 @@ def _build_redaction_set(
                 if _name == f["type"]:
                     m = pattern.search(text[f["start"]:f["end"]])
                     if m and m.lastindex:
-                        secret_set.add(m.group(m.lastindex))
+                        captured = m.group(m.lastindex)
+                        if captured:
+                            secret_set.add(captured)
                     break
 
             # Build log entry
@@ -439,8 +529,16 @@ def _build_redaction_set(
                 start, end = f["start"], f["end"]
                 ctx_before = text[max(0, start - 40):start]
                 ctx_after = text[end:end + 40]
-                entry["context_before"] = _redact_high_confidence_only(ctx_before)
-                entry["context_after"] = _redact_high_confidence_only(ctx_after)
+                entry["context_before"] = _redact_detected_without_log(
+                    ctx_before,
+                    user_allowlist=user_allowlist,
+                    custom_strings=custom_strings,
+                )
+                entry["context_after"] = _redact_detected_without_log(
+                    ctx_after,
+                    user_allowlist=user_allowlist,
+                    custom_strings=custom_strings,
+                )
             all_log.append(entry)
 
     # Add custom strings to the redaction set
@@ -476,7 +574,17 @@ def _apply_to_value(value: Any, secret_set: set[str]) -> tuple[Any, int]:
         total = 0
         out = {}
         for k, v in value.items():
-            out[k], n = _apply_to_value(v, secret_set)
+            new_key, key_count = _apply_to_value(k, secret_set)
+            redacted_value, n = _apply_to_value(v, secret_set)
+            # Multiple sensitive keys may collapse to the same placeholder.
+            # Preserve all values without reintroducing their original keys.
+            candidate = new_key
+            suffix = 2
+            while candidate in out:
+                candidate = f"{new_key}_{suffix}"
+                suffix += 1
+            out[candidate] = redacted_value
+            total += key_count
             total += n
         return out, total
     if isinstance(value, list):
@@ -527,24 +635,12 @@ def redact_session(
         if pass_num == 0:
             all_log = log
 
-        # Step 3: Apply redaction set across all fields
-        pass_count = 0
-
-        for field in ("display_title", "project", "git_branch"):
-            if session.get(field) and isinstance(session[field], str):
-                session[field], n = _apply_redaction_set(session[field], secret_set)
-                pass_count += n
-
-        for msg in session.get("messages", []):
-            for field in ("content", "thinking"):
-                if msg.get(field) and isinstance(msg[field], str):
-                    msg[field], n = _apply_redaction_set(msg[field], secret_set)
-                    pass_count += n
-            for tool_use in msg.get("tool_uses", []):
-                for tf in ("input", "output"):
-                    if tool_use.get(tf):
-                        tool_use[tf], n = _apply_to_value(tool_use[tf], secret_set)
-                        pass_count += n
+        # Step 3: Apply the set to the complete final session, including
+        # derived export fields (commands_run/files_touched), nested structures,
+        # and dictionary keys.  Keep the public in-place mutation behaviour.
+        redacted_session, pass_count = _apply_to_value(session, secret_set)
+        session.clear()
+        session.update(redacted_session)
 
         total += pass_count
 

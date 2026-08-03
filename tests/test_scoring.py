@@ -18,6 +18,7 @@ from agentstracer.scoring import (
     Step,
     _extract_judge_result_from_value,
     _resolve_scoring_backend,
+    _validate_judge_result,
     call_judge,
     compute_basic_metrics,
     extract_tool_uses,
@@ -69,6 +70,10 @@ class TestGetMessageText:
     def test_list_with_string(self):
         msg = {"content": ["hello"]}
         assert get_message_text(msg) == "hello"
+
+    def test_joins_all_text_blocks(self):
+        msg = {"content": ["first", {"type": "text", "text": "second"}]}
+        assert get_message_text(msg) == "first\nsecond"
 
     def test_empty(self):
         assert get_message_text({}) == ""
@@ -145,6 +150,7 @@ class TestSegmentSession:
         segments = segment_session(messages)
         assert len(segments) == 1
         assert len(segments[0].steps) == 0
+        assert segments[0].assistant_response == "Hi there"
 
     def test_empty_messages(self):
         assert segment_session([]) == []
@@ -172,6 +178,17 @@ class TestSegmentSession:
         assert len(segments) == 1
         assert len(segments[0].steps) == 1
         assert segments[0].steps[0].reflect == "I see the issue"
+        assert segments[0].assistant_response == "I see the issue"
+
+    def test_consecutive_reflections_are_preserved(self):
+        messages = [
+            _user_msg("Do it"),
+            _asst_msg("Starting", [_tool_use("Read", "f.py", "contents")]),
+            _asst_msg("First thought"), _asst_msg("Second thought"),
+        ]
+        segment = segment_session(messages)[0]
+        assert segment.steps[0].reflect == "First thought\nSecond thought"
+        assert segment.assistant_response == "First thought\nSecond thought"
 
     def test_assistant_only_session(self):
         messages = [
@@ -227,6 +244,11 @@ class TestComputeBasicMetrics:
         assert m["total_steps"] == 3
         assert m["segments"] == 2
         assert m["tool_failures"] == 1
+
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
+    def test_failure_status_variants(self, status):
+        segment = Segment("x", [Step("", "Bash", "x", "bad", status, "")])
+        assert compute_basic_metrics([segment], {})["tool_failures"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +308,28 @@ class TestFormatSessionForJudge:
         ])
         text = format_session_for_judge([seg], "Do it")
         assert "No response — session ended" in text
+
+    def test_shows_reflection_and_final_response(self):
+        seg = Segment(
+            user_message="Do it",
+            steps=[Step("", "Read", "f.py", "ok", "success", "Found issue")],
+            assistant_response="Done and verified",
+        )
+        text = format_session_for_judge([seg], "Do it")
+        assert "Reflection: Found issue" in text
+        assert "## Agent Response\nDone and verified" in text
+
+
+class TestValidateJudgeResult:
+    def test_rejects_boolean_scores_and_non_object_taste(self):
+        result = _validate_judge_result({
+            "quality": True, "outcome": False, "intent": True,
+            "reasoning": "x", "taste": "invalid",
+        })
+        assert result["quality"] == 3
+        assert result["outcome"] == 3
+        assert result["intent"] == 3
+        assert result["taste"] == {"detected": False}
 
 
 # ---------------------------------------------------------------------------
