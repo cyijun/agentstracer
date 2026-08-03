@@ -324,7 +324,7 @@ class TestListProjects:
         monkeypatch.setattr("agentstracer.cli.discover_projects", lambda: [])
         list_projects()
         captured = capsys.readouterr()
-        assert "No Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom sessions" in captured.out
+        assert "No Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi Code CLI, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(

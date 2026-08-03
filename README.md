@@ -86,7 +86,7 @@ agentstracer langfuse sync --source all --verify
 | 工具 | 数据位置 | 状态 |
 |------|---------|------|
 | Claude Code | `~/.claude/projects/` | ✅ |
-| Kimi CLI | `~/.kimi/sessions/` | ✅ |
+| Kimi Code CLI | `~/.kimi-code/sessions/` | ✅ |
 | Codex CLI | `~/.codex/sessions/` | ✅ |
 | OpenCode | `~/.local/share/opencode/` | ✅ |
 | OpenClaw | `~/.openclaw/` | ✅ |
