@@ -2698,6 +2698,71 @@ def _run_card(args: argparse.Namespace) -> None:
             print(card_result["card_text"])
 
 
+def _run_langfuse(args) -> None:
+    """Run Langfuse doctor/preview/sync without ever printing credentials."""
+    from .langfuse_export import (
+        DEFAULT_LEDGER_PATH,
+        LangfuseConfig,
+        LangfuseExportError,
+        LangfuseOTLPClient,
+        smoke_test,
+        sync_traces,
+    )
+    from .trace_adapters import TRACE_SOURCES, iter_agent_traces
+    from .trace_model import sanitize_trace
+
+    try:
+        if args.langfuse_command == "doctor":
+            client = LangfuseOTLPClient(LangfuseConfig.from_env())
+            print(json.dumps(client.doctor(), ensure_ascii=False, indent=2))
+            return
+        if args.langfuse_command == "smoke":
+            client = LangfuseOTLPClient(LangfuseConfig.from_env())
+            result = smoke_test(client)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            if not result["ok"]:
+                raise SystemExit(1)
+            return
+
+        selected = args.source or ["all"]
+        sources = list(TRACE_SOURCES) if "all" in selected else list(dict.fromkeys(selected))
+        dry_run = args.langfuse_command == "preview"
+        client = None if dry_run else LangfuseOTLPClient(LangfuseConfig.from_env())
+        local_config = load_config()
+        anonymizer = Anonymizer(extra_usernames=local_config.get("redact_usernames", []))
+        custom_strings = tuple(local_config.get("redact_strings", []))
+
+        def prepared_traces():
+            for trace in iter_agent_traces(
+                sources,
+                include_thinking=not args.no_thinking,
+            ):
+                if args.project and args.project.lower() not in str(trace.project or "").lower():
+                    continue
+                yield sanitize_trace(
+                    trace,
+                    anonymizer=anonymizer,
+                    custom_strings=custom_strings,
+                    redact_secrets=not args.unsafe_no_redaction,
+                )
+
+        summary = sync_traces(
+            prepared_traces(),
+            client=client,
+            ledger_path=args.ledger or DEFAULT_LEDGER_PATH,
+            dry_run=dry_run,
+            force=args.force,
+            verify=args.verify,
+            limit=args.limit,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if summary.get("traces_failed") or summary.get("verification_failed"):
+            raise SystemExit(1)
+    except LangfuseExportError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="AgentsTrace — coding agent conversation exporter")
     sub = parser.add_subparsers(dest="command")
@@ -2738,6 +2803,40 @@ def main() -> None:
                      help="Disable secrets redaction for private use (preserves API keys, tokens)")
     cfg.add_argument("--confirm-projects", action="store_true",
                      help="Mark project selection as confirmed (include all)")
+
+    # Langfuse observability export. Credentials are intentionally accepted
+    # only through environment variables so they never land in shell history,
+    # the AgentsTrace config file, or command output.
+    lf = sub.add_parser("langfuse", help="Export structured agent traces to Langfuse")
+    lf_sub = lf.add_subparsers(dest="langfuse_command", required=True)
+    lf_sub.add_parser("doctor", help="Check Langfuse credentials and API compatibility")
+    lf_sub.add_parser("smoke", help="Write and read back a content-safe synthetic trace")
+    for action in ("sync", "preview"):
+        lf_sync = lf_sub.add_parser(
+            action,
+            help=("Build and export new immutable traces" if action == "sync" else "Build traces locally without network access"),
+        )
+        lf_sync.add_argument(
+            "--source", action="append",
+            choices=["claude", "codex", "gemini", "kimi", "opencode", "openclaw", "all"],
+            help="Source to include; repeat for multiple sources (default: all)",
+        )
+        lf_sync.add_argument("--project", type=str, default=None,
+                             help="Only include traces whose project contains this string")
+        lf_sync.add_argument("--limit", type=int, default=None,
+                             help="Maximum traces to preview/export")
+        lf_sync.add_argument("--no-thinking", action="store_true",
+                             help="Exclude thinking/reasoning content")
+        lf_sync.add_argument("--verify", action="store_true",
+                             help="Read each exported trace back through the compatible Observations API")
+        lf_sync.add_argument("--force", action="store_true",
+                             help="Re-export snapshots already marked successful (may create duplicate observations)")
+        lf_sync.add_argument("--ledger", type=Path, default=None,
+                             help="Custom local sync-ledger SQLite path")
+        lf_sync.add_argument(
+            "--unsafe-no-redaction", action="store_true",
+            help="Disable secret redaction before network export (unsafe; username/path anonymization remains)",
+        )
 
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
@@ -2924,6 +3023,10 @@ def main() -> None:
 
     args = parser.parse_args()
     command = args.command or "export"
+
+    if command == "langfuse":
+        _run_langfuse(args)
+        return
 
     if command == "serve":
         from .daemon import run_server

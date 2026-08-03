@@ -1,4 +1,4 @@
-# AgentsTrace (Local-Only Fork)
+# AgentsTrace（Privacy-First Fork）
 
 原版：[kaiaiagent/clawtrace](https://github.com/kaiaiagent/clawtrace)
 
@@ -54,6 +54,30 @@ agentstracer serve
 # 查看配置
 agentstracer config
 ```
+
+### Langfuse 可观测性
+
+Langfuse 凭据只从环境变量读取，不会写入 AgentsTrace 配置或同步账本：
+
+```bash
+export LANGFUSE_BASE_URL="https://langfuse.example.com"
+export LANGFUSE_PUBLIC_KEY="..."
+export LANGFUSE_SECRET_KEY="..."
+
+# 检查服务端版本和凭据
+agentstracer langfuse doctor
+
+# 写入并回读一条不含本机对话的合成 trace
+agentstracer langfuse smoke
+
+# 只在本机解析、脱敏和检查，不发起网络请求
+agentstracer langfuse preview --source all
+
+# 增量同步并通过 Observations API v2 回读验证
+agentstracer langfuse sync --source all --verify
+```
+
+同步会保留 agent / subagent / user-turn / generation / tool / event 树、时间边界与质量标记、模型和 token usage。Codex 会优先消费官方 `codex-rollout-trace` bundle，得到真实 inference、tool dispatch、code cell、terminal、subagent 边和严格递增 `seq`；未启用 bundle 的历史会话回退到 session JSONL。schema 覆盖以官方协议类型为基准，真正未知的类型以 WARNING observation 显式呈现。默认进行 secrets、用户名和路径脱敏，并以本地 SQLite 账本防止同一快照重复上传。启用方式、实现与数据源能力说明见 [Langfuse 采集设计](docs/LANGFUSE.md#codex-官方-rollout-trace)。
 
 ---
 
@@ -112,15 +136,15 @@ agentstracer config
 
 ## 关于本版本
 
-这是 [AgentsTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，专注于**本地隐私保护**和**纯离线使用**。
+这是 [AgentsTrace](https://github.com/kaiaiagent/clawtrace) 的修改版本，默认专注于**本地隐私保护**；只有显式执行 `agentstracer langfuse sync` 才会向用户配置的 Langfuse 服务发送数据。
 
 ### 主要修改点
 
-#### 1. 移除所有网络功能
+#### 1. 移除公共数据上传功能
 - ❌ 云上传功能
 - ❌ Skill 下载功能
 - ❌ 浏览器自动打开
-- ❌ 所有 urllib 网络请求
+- ✅ 可选、显式的私有 Langfuse OTLP 同步
 
 #### 2. 可选禁用 Secrets 脱敏
 - 新增 `--no-secrets-redaction` 配置
@@ -137,7 +161,8 @@ agentstracer config
 
 | 功能 | 原版 | 本版本 |
 |------|------|--------|
-| 云上传 | ✅ | ❌ 已移除 |
+| 公共云上传 | ✅ | ❌ 已移除 |
+| 私有 Langfuse | ❌ | ✅ 显式启用 |
 | Skill 下载 | ✅ | ❌ 已移除 |
 | 可选禁用脱敏 | ❌ | ✅ 支持 |
 | 适用场景 | 分享数据集 | 私人本地分析 |

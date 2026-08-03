@@ -1322,6 +1322,32 @@ class TestBuildCodexToolResultMap:
         assert "Successfully applied patch" in result["call-2"]["output"]["output"]
         assert result["call-2"]["output"]["duration_seconds"] == 0.5
 
+    def test_structured_function_output_is_preserved(self, mock_anonymizer):
+        entries = [{
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-list",
+                "output": [{"type": "text", "text": "hello"}],
+            },
+        }]
+        result = _build_codex_tool_result_map(entries, mock_anonymizer)
+        assert json.loads(result["call-list"]["output"]["output"]) == [
+            {"type": "text", "text": "hello"},
+        ]
+
+    def test_structured_custom_output_is_preserved(self, mock_anonymizer):
+        entries = [{
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-custom-list",
+                "output": ["one", "two"],
+            },
+        }]
+        result = _build_codex_tool_result_map(entries, mock_anonymizer)
+        assert json.loads(result["call-custom-list"]["output"]["output"]) == ["one", "two"]
+
     def test_non_response_item_ignored(self, mock_anonymizer):
         entries = [
             {
@@ -1398,6 +1424,28 @@ class TestBuildCodexToolResultMap:
         assert tu["status"] == "success"
         assert tu["output"]["exit_code"] == 0
         assert "foo.py" in tu["output"]["output"]
+
+    def test_response_item_only_session_keeps_messages(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "response-only.jsonl"
+        entries = [
+            {"timestamp": "2026-02-24T16:00:00Z", "type": "session_meta",
+             "payload": {"id": "response-only", "cwd": "/work/repo"}},
+            {"timestamp": "2026-02-24T16:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": "hello"}]}},
+            {"timestamp": "2026-02-24T16:00:02Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "hi"}]}},
+        ]
+        session_file.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        result = _parse_codex_session_file(
+            session_file, mock_anonymizer, include_thinking=True,
+            target_cwd="/work/repo",
+        )
+        assert result is not None
+        assert [(message["role"], message["content"]) for message in result["messages"]] == [
+            ("user", "hello"), ("assistant", "hi"),
+        ]
 
 
 # --- OpenClaw session parsing ---

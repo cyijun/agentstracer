@@ -191,14 +191,13 @@ def test_review_session_pii_with_claude(monkeypatch):
         "messages": [{"content": "Kai D from Acme"}],
     }
 
-    def fake_review(session_id, message_index, field, text, **kwargs):
-        assert session_id == "s1"
-        assert field == "content"
-        assert text == "Kai D from Acme"
+    def fake_review(session_value, *, backend, **kwargs):
+        assert session_value == session
+        assert backend == "claude"
         return [{
-            "session_id": session_id,
-            "message_index": message_index,
-            "field": field,
+            "session_id": "s1",
+            "message_index": 0,
+            "field": "content",
             "entity_text": "Kai D",
             "entity_type": "person_name",
             "confidence": 0.95,
@@ -207,7 +206,7 @@ def test_review_session_pii_with_claude(monkeypatch):
             "source": "claude",
         }]
 
-    monkeypatch.setattr("agentstracer.pii._review_text_with_agent", fake_review)
+    monkeypatch.setattr("agentstracer.pii.review_session_pii_with_agent", fake_review)
     findings = review_session_pii_with_claude(session)
     assert findings[0]["entity_text"] == "Kai D"
     assert findings[0]["source"] == "claude"
